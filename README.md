@@ -55,8 +55,7 @@ Unsupported architectures are rejected before any download or install attempt.
 ## Install
 
 ```sh
-wget -q https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -O /usr/bin/openwrt-adguardhome-updater
-chmod +x /usr/bin/openwrt-adguardhome-updater
+wget -q https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -O /usr/bin/openwrt-adguardhome-updater && chmod +x /usr/bin/openwrt-adguardhome-updater && /usr/bin/openwrt-adguardhome-updater --dry-run
 ```
 
 > Run manually. Do not add to cron.
