@@ -1,0 +1,1241 @@
+#!/bin/sh
+# openwrt-adguardhome-updater
+#
+# Vanilla OpenWrt AdGuard Home updater for manual binary installs.
+#
+# Supports:
+# - OpenWrt 25.12+ using apk
+# - OpenWrt 24.10 and older using opkg
+#
+# What it does:
+# - Detects AdGuardHome install path from running process, known locations,
+#   or --install-dir override
+# - Detects CPU architecture and maps to AdGuardHome release asset name
+# - Guards against package-managed installs (apk/opkg)
+# - Fetches latest stable version from GitHub releases API
+# - Backs up full install directory before any change
+# - Replaces only the binary; config, data, and blocklists are preserved
+# - Validates DNS health after update (process + port + resolution)
+# - Auto-rollbacks on failed health check
+# - Adds key paths to /etc/sysupgrade.conf
+#
+# What it does NOT do:
+# - Does not modify AdGuardHome config or settings
+# - Does not update package-managed AdGuardHome installs directly.
+#   Package-managed installs can be converted to standalone binaries
+#   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
+# - Should not be run as a cron job (briefly stops DNS)
+
+SCRIPT_VERSION="2026.05.22.04"
+SCRIPT_NAME="openwrt-adguardhome-updater"
+
+AGH_DIR=""
+AGH_BINARY=""
+AGH_INIT=""
+AGH_CONFIG=""
+AGH_RELEASES_URL="https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest"
+AGH_DOWNLOAD_BASE="https://github.com/AdguardTeam/AdGuardHome/releases/download"
+
+INSTALL_DIR_OVERRIDE=""
+
+BACKUP_DIR="/root/adguardhome-updater/backups"
+TMP_DIR="/tmp/adguardhome-updater"
+TMP_TARBALL="${TMP_DIR}/AdGuardHome.tar.gz"
+TMP_EXTRACT="${TMP_DIR}/extract"
+
+MIN_FREE_MB=60
+
+DRY_RUN=0
+FORCE=0
+KEEP_TMP=0
+ROLLBACK=0
+ROLLBACK_FILE=""
+LIST_BACKUPS=0
+DELETE_BACKUP=""
+ASSUME_YES=0
+NON_INTERACTIVE=0
+PERSIST_SYSUPGRADE=1
+MIGRATE_FROM_PACKAGE=0
+CONFIRMED_LAN=0
+
+PKG_MANAGER="unknown"
+AGH_PKG_NAME=""
+AGH_ARCH=""
+BACKUP_FILE_CREATED=""
+CURRENT_VERSION=""
+LATEST_VERSION=""
+OWRT_VER=""
+FREE_MB=0
+
+
+# ──────────────────────────────────────────────────────────────
+# UI helpers
+# ──────────────────────────────────────────────────────────────
+
+setup_colors() {
+    if [ -t 1 ]; then
+        C_RESET='\033[0m'
+        C_RED='\033[0;31m'
+        C_GREEN='\033[0;32m'
+        C_YELLOW='\033[0;33m'
+        C_CYAN='\033[0;36m'
+        C_DIM='\033[0;37m'
+        C_BOLD='\033[1m'
+    else
+        C_RESET=''
+        C_RED=''
+        C_GREEN=''
+        C_YELLOW=''
+        C_CYAN=''
+        C_DIM=''
+        C_BOLD=''
+    fi
+
+    case "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" in
+        *UTF-8*|*utf-8*|*utf8*)
+            USE_UNICODE=1
+            ;;
+        *)
+            USE_UNICODE=0
+            ;;
+    esac
+}
+
+is_tty() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+hr() {
+    if [ "${USE_UNICODE:-0}" -eq 1 ]; then
+        printf '══════════════════════════════════════════════════════════════════════\n'
+    else
+        printf '======================================================================\n'
+    fi
+}
+
+box() {
+    if [ "${USE_UNICODE:-0}" -eq 1 ]; then
+        printf '┌──────────────────────────────────────────────────────────────────┐\n'
+        while [ $# -gt 0 ]; do
+            printf '│ %-68s │\n' "$1"
+            shift
+        done
+        printf '└──────────────────────────────────────────────────────────────────┘\n'
+    else
+        printf '+------------------------------------------------------------------+\n'
+        while [ $# -gt 0 ]; do
+            printf '| %-64s |\n' "$1"
+            shift
+        done
+        printf '+------------------------------------------------------------------+\n'
+    fi
+}
+
+ui_ok() {
+    printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"
+}
+
+ui_warn() {
+    printf "${C_YELLOW}[!]${C_RESET} %s\n" "$*"
+}
+
+ui_step() {
+    printf "${C_DIM}[->]${C_RESET} %s\n" "$*"
+}
+
+ui_err() {
+    printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*"
+}
+
+confirm() {
+    local question="$1"
+    local default="${2:-n}"
+    local answer prompt
+
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        return 0
+    fi
+
+    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+        [ "$default" = "y" ] && return 0
+        return 1
+    fi
+
+    if [ "$default" = "y" ]; then
+        prompt="Y/n"
+    else
+        prompt="y/N"
+    fi
+
+    while true; do
+        printf "${C_CYAN}> %s (%s) ${C_RESET}" "$question" "$prompt"
+        read -r answer
+        [ -n "$answer" ] || answer="$default"
+        case "$answer" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO)   return 1 ;;
+            *) ui_warn "Please answer y or n." ;;
+        esac
+    done
+}
+
+log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    case "$level" in
+        INFO)    ui_step "$msg" ;;
+        SUCCESS) ui_ok   "$msg" ;;
+        WARN)    ui_warn "$msg" ;;
+        ERROR)   ui_err  "$msg" ;;
+        *)       printf "[%s] %s\n" "$SCRIPT_NAME" "$msg" ;;
+    esac
+}
+
+cleanup() {
+    if [ "$KEEP_TMP" -eq 0 ] && [ -d "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+
+die() {
+    ui_err "$*"
+    cleanup
+    exit 1
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Usage
+# ──────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} [options]
+
+  (no flags)              Update to latest stable release (interactive)
+  --dry-run               Check current vs latest version, make no changes
+  --force                 Reinstall even if already on latest version
+  --yes | -y              Assume yes to all prompts
+  --non-interactive       Skip all prompts, use defaults
+  --no-persist            Skip adding paths to /etc/sysupgrade.conf
+  --keep-tmp              Do not delete /tmp download files after install
+  --install-dir <path>    Override detected install directory
+  --rollback              Restore the latest backup
+  --rollback <file>       Restore a specific backup file
+  --list-backups          List available backups
+  --delete-backup <file>  Delete a specific backup file
+  --delete-backup all     Delete all backups
+  --migrate-from-package  Convert package-managed AdGuardHome to standalone binary
+  --migrate-from-apk      Alias for --migrate-from-package
+  --migrate-from-opkg     Alias for --migrate-from-package
+    --yes-i-have-lan-access   Required confirmation for migration (DNS drops briefly)
+  --help                  Show this help
+
+Examples:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} --dry-run
+  ${SCRIPT_NAME} --yes
+  ${SCRIPT_NAME} --rollback
+  ${SCRIPT_NAME} --migrate-from-package --yes-i-have-lan-access
+  ${SCRIPT_NAME} --migrate-from-apk --yes-i-have-lan-access
+  ${SCRIPT_NAME} --migrate-from-opkg --yes-i-have-lan-access
+EOF
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run)         DRY_RUN=1 ;;
+            --force)           FORCE=1 ;;
+            --keep-tmp)        KEEP_TMP=1 ;;
+            --yes|-y)          ASSUME_YES=1 ;;
+            --non-interactive) NON_INTERACTIVE=1 ;;
+            --no-persist)      PERSIST_SYSUPGRADE=0 ;;
+            --list-backups)    LIST_BACKUPS=1 ;;
+            --install-dir)
+                [ -n "$2" ] || die "--install-dir requires a path argument."
+                INSTALL_DIR_OVERRIDE="$2"
+                shift
+                ;;
+            --delete-backup)
+                [ -n "$2" ] || die "--delete-backup requires a backup file path or 'all'."
+                DELETE_BACKUP="$2"
+                shift
+                ;;
+            --rollback)
+                ROLLBACK=1
+                if [ -n "$2" ] && [ "${2#-}" = "$2" ]; then
+                    ROLLBACK_FILE="$2"
+                    shift
+                fi
+                ;;
+            --migrate-from-package|--migrate-from-apk|--migrate-from-opkg)
+                MIGRATE_FROM_PACKAGE=1 ;;
+            --yes-i-have-lan-access) CONFIRMED_LAN=1 ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown argument: $1. Use --help for usage."
+                ;;
+        esac
+        shift
+    done
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Detection
+# ──────────────────────────────────────────────────────────────
+
+require_root_openwrt() {
+    [ "$(id -u)" -eq 0 ] || die "Must be run as root."
+    [ -f /etc/openwrt_release ] || die "This script is intended for OpenWrt only."
+}
+
+detect_arch() {
+    local cpu_arch
+    cpu_arch="$(uname -m)"
+
+    case "$cpu_arch" in
+        aarch64|arm64)   AGH_ARCH="arm64" ;;
+        armv8l|armv7l)   AGH_ARCH="armv7" ;;
+        armv6l)          AGH_ARCH="armv6" ;;
+        armv5l)          AGH_ARCH="armv5" ;;
+        x86_64|amd64)    AGH_ARCH="amd64" ;;
+        i386|i486|i686|i786) AGH_ARCH="386" ;;
+        riscv64)         AGH_ARCH="riscv64" ;;
+        mips|mips64)
+            if grep -qiE "mips.*el|mipsel|mipsle" /proc/cpuinfo 2>/dev/null; then
+                AGH_ARCH="${cpu_arch}le_softfloat"
+            else
+                AGH_ARCH="${cpu_arch}_softfloat"
+            fi
+            ;;
+        mipsel) AGH_ARCH="mipsle_softfloat" ;;
+        *)      die "Unsupported CPU architecture: ${cpu_arch}" ;;
+    esac
+}
+
+detect_agh_install() {
+    if [ -n "$INSTALL_DIR_OVERRIDE" ]; then
+        [ -d "$INSTALL_DIR_OVERRIDE" ] || die "--install-dir path does not exist: ${INSTALL_DIR_OVERRIDE}"
+        AGH_DIR="$INSTALL_DIR_OVERRIDE"
+        AGH_BINARY="${AGH_DIR}/AdGuardHome"
+        [ -x "$AGH_BINARY" ] || die "AdGuardHome binary not found or not executable at ${AGH_BINARY}"
+    else
+        local pid proc_path candidate
+        pid="$(pidof AdGuardHome 2>/dev/null | awk '{print $1}')"
+        if [ -n "$pid" ]; then
+            proc_path="$(readlink -f "/proc/${pid}/exe" 2>/dev/null)"
+            if [ -n "$proc_path" ] && [ -x "$proc_path" ]; then
+                AGH_BINARY="$proc_path"
+                AGH_DIR="$(dirname "$proc_path")"
+            fi
+        fi
+
+        if [ -z "$AGH_DIR" ]; then
+            for candidate in /etc/AdGuardHome /opt/AdGuardHome /usr/local/AdGuardHome /usr/bin; do
+                if [ -x "${candidate}/AdGuardHome" ]; then
+                    AGH_DIR="$candidate"
+                    AGH_BINARY="${AGH_DIR}/AdGuardHome"
+                    break
+                fi
+            done
+        fi
+
+        [ -n "$AGH_DIR" ] || die "Could not detect AdGuardHome install directory. Use --install-dir."
+    fi
+
+    if [ -f "${AGH_DIR}/AdGuardHome.yaml" ]; then
+        AGH_CONFIG="${AGH_DIR}/AdGuardHome.yaml"
+    elif [ -f "${AGH_DIR}/config.yaml" ]; then
+        AGH_CONFIG="${AGH_DIR}/config.yaml"
+    fi
+
+    local init_candidate
+    for init_candidate in /etc/init.d/adguardhome /etc/init.d/AdGuardHome; do
+        if [ -x "$init_candidate" ]; then
+            AGH_INIT="$init_candidate"
+            break
+        fi
+    done
+
+    [ -n "$AGH_INIT" ] || die "Could not find AdGuardHome init script."
+}
+
+detect_pkg_manager() {
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"
+    elif command -v opkg >/dev/null 2>&1; then
+        PKG_MANAGER="opkg"
+    else
+        PKG_MANAGER="unknown"
+    fi
+}
+
+check_agh_pkg_managed() {
+    local pkg_managed=0
+    case "$PKG_MANAGER" in
+        apk)
+            if apk info 2>/dev/null | grep -Eiq '^adguardhome$|^adguard-home$'; then
+                pkg_managed=1
+            fi
+            ;;
+        opkg)
+            if opkg list-installed 2>/dev/null | awk '{print $1}' | grep -Eiq '^adguardhome$|^adguard-home$'; then
+                pkg_managed=1
+            fi
+            ;;
+    esac
+
+    if [ "$pkg_managed" -eq 1 ]; then
+        ui_err "AdGuardHome appears to be managed by ${PKG_MANAGER}."
+        ui_err "This updater is for manual binary installs only."
+        printf '\n'
+        case "$PKG_MANAGER" in
+            apk)
+                ui_step "To update via package manager:  apk update && apk upgrade adguardhome"
+                ui_step "To migrate to upstream binaries: ${SCRIPT_NAME} --migrate-from-apk --yes-i-have-lan-access"
+                ;;
+            opkg)
+                ui_step "To update via package manager:  opkg update && opkg upgrade adguardhome"
+                ui_step "To migrate to upstream binaries: ${SCRIPT_NAME} --migrate-from-opkg --yes-i-have-lan-access"
+                ;;
+        esac
+        printf '\n'
+        exit 1
+    fi
+}
+
+get_current_version() {
+    if [ ! -x "$AGH_BINARY" ]; then
+        CURRENT_VERSION="not installed"
+        return
+    fi
+    CURRENT_VERSION="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    [ -n "$CURRENT_VERSION" ] || CURRENT_VERSION="unknown"
+}
+
+get_latest_version() {
+    local response
+    response="$(wget -q -O - "$AGH_RELEASES_URL" 2>/dev/null)"
+    [ -n "$response" ] || die "Failed to fetch latest release info from GitHub API."
+    LATEST_VERSION="$(printf '%s' "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')"
+    [ -n "$LATEST_VERSION" ] || die "Could not parse latest stable version from GitHub API response."
+}
+
+get_dns_port() {
+    if [ -n "$AGH_CONFIG" ] && [ -f "$AGH_CONFIG" ]; then
+        local parsed
+        parsed="$(
+            awk '
+                /^[[:space:]]*dns:[[:space:]]*$/ {in_dns=1; next}
+                /^[^[:space:]][^:]*:[[:space:]]*$/ && in_dns {in_dns=0}
+                in_dns && /^[[:space:]]*port:[[:space:]]*[0-9]+/ {
+                    gsub(/[^0-9]/, "", $2)
+                    print $2
+                    exit
+                }
+            ' "$AGH_CONFIG" 2>/dev/null | grep -E '^[0-9]+$' | head -1
+        )"
+        if [ -n "$parsed" ]; then
+            echo "$parsed"
+            return
+        fi
+    fi
+    echo "3053"
+}
+
+get_web_port() {
+    if [ -n "$AGH_CONFIG" ] && [ -f "$AGH_CONFIG" ]; then
+        local parsed
+        parsed="$(
+            awk '
+                /^[[:space:]]*http:[[:space:]]*$/ {in_http=1; next}
+                /^[^[:space:]][^:]*:[[:space:]]*$/ && in_http {in_http=0}
+                in_http && /^[[:space:]]*address:[[:space:]]/ {
+                    line=$0
+                    gsub(/["'"'"' ]/, "", line)
+                    sub(/^[[:space:]]*address:/, "", line)
+                    if (line ~ /\]:[0-9]+$/) {
+                        sub(/^.*\]:/, "", line)
+                        print line
+                        exit
+                    }
+                    if (line ~ /:[0-9]+$/) {
+                        sub(/^.*:/, "", line)
+                        print line
+                        exit
+                    }
+                }
+            ' "$AGH_CONFIG" 2>/dev/null | grep -E '^[0-9]+$' | head -1
+        )"
+        if [ -n "$parsed" ]; then
+            echo "$parsed"
+            return
+        fi
+    fi
+    echo "3000"
+}
+
+show_web_access_url() {
+    local web_port lan_dev lan_ip
+    web_port="$(get_web_port)"
+
+    # 1. Try ubus to get the actual LAN L3 device (most reliable on OpenWrt)
+    lan_dev="$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+    if [ -n "$lan_dev" ]; then
+        lan_ip="$(ip -4 addr show "$lan_dev" 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
+    fi
+
+    # 2. Fall back to br-lan directly
+    if [ -z "$lan_ip" ]; then
+        lan_ip="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
+    fi
+
+    # 3. Fall back to any non-loopback IPv4
+    if [ -z "$lan_ip" ]; then
+        lan_ip="$(ip -4 addr show 2>/dev/null | awk '/inet / && !/127\.0\.0\.1/ {sub(/\/.*/, "", $2); print $2; exit}')"
+    fi
+
+    printf '\n'
+    if [ -n "$lan_ip" ]; then
+        ui_ok "AdGuardHome web interface: ${C_CYAN}http://${lan_ip}:${web_port}/${C_RESET}"
+    else
+        ui_ok "AdGuardHome web interface: http://<router-ip>:${web_port}/"
+    fi
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Preflight
+# ──────────────────────────────────────────────────────────────
+
+preflight_common() {
+    require_root_openwrt
+    detect_agh_install
+}
+
+preflight_update() {
+    require_root_openwrt
+
+    OWRT_VER="$(grep DISTRIB_RELEASE /etc/openwrt_release | cut -d= -f2 | tr -d '"')"
+
+    detect_agh_install
+    detect_pkg_manager
+    check_agh_pkg_managed
+
+    for dep in wget tar gzip; do
+        command -v "$dep" >/dev/null 2>&1 || die "Required dependency not found: ${dep}"
+    done
+
+    local free_kb
+    free_kb="$(df /tmp | awk 'NR==2 {print $4}')"
+    FREE_MB=$(( free_kb / 1024 ))
+    [ "$FREE_MB" -ge "$MIN_FREE_MB" ] || die "Insufficient free space in /tmp. Need ${MIN_FREE_MB} MB, have ${FREE_MB} MB."
+
+    detect_arch
+    get_current_version
+    get_latest_version
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Interactive display
+# ──────────────────────────────────────────────────────────────
+
+interactive_preflight_display() {
+    hr
+    ui_step "Checking prerequisites"
+    printf '\n'
+
+    ui_ok "OpenWrt ${OWRT_VER} detected"
+    ui_ok "Package manager: ${PKG_MANAGER}"
+    ui_ok "AdGuardHome is a manual binary install"
+
+    local cpu_arch
+    cpu_arch="$(uname -m)"
+    ui_ok "Architecture: ${cpu_arch} -> ${AGH_ARCH}"
+    ui_ok "Free space in /tmp: ${FREE_MB} MB"
+
+    printf '\n'
+    ui_ok "Install directory: ${AGH_DIR}"
+    ui_ok "Binary:            ${AGH_BINARY}"
+    ui_ok "Config:            ${AGH_CONFIG:-not found}"
+    ui_ok "Init script:       ${AGH_INIT}"
+
+    printf '\n'
+    ui_ok "Current version: ${CURRENT_VERSION}"
+    ui_ok "Latest version:  ${LATEST_VERSION}"
+
+    printf '\n'
+    ui_ok "Prerequisites met."
+    printf '\n'
+}
+
+interactive_update_summary() {
+    hr
+    printf '\n'
+
+    box \
+        "Install directory: ${AGH_DIR}" \
+        "Binary:            ${AGH_BINARY}" \
+        "Config:            ${AGH_CONFIG:-not found}" \
+        "Init script:       ${AGH_INIT}" \
+        "Current version:   ${CURRENT_VERSION}" \
+        "Latest version:    ${LATEST_VERSION}" \
+        "DNS port:          $(get_dns_port)"
+
+    printf '\n'
+    ui_warn "AdGuardHome will be stopped briefly during the update."
+    ui_warn "DNS may be interrupted for clients during this time."
+    ui_warn "A backup will be created before replacing the binary."
+    printf '\n'
+
+    confirm "Do you want to continue with the update?" "n" || die "Aborted by user."
+
+    printf '\n'
+    if confirm "Add AdGuardHome and this updater to /etc/sysupgrade.conf?" "y"; then
+        PERSIST_SYSUPGRADE=1
+    else
+        PERSIST_SYSUPGRADE=0
+        ui_warn "Skipping sysupgrade persistence."
+    fi
+    printf '\n'
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Version check
+# ──────────────────────────────────────────────────────────────
+
+is_update_needed() {
+    if [ "$FORCE" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$CURRENT_VERSION" = "not installed" ] || [ "$CURRENT_VERSION" = "unknown" ]; then
+        return 0
+    fi
+    [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Backup
+# ──────────────────────────────────────────────────────────────
+
+backup_current() {
+    ui_step "Creating backup..."
+    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$TMP_DIR"
+
+    local ts backup_file manifest tmp_manifest init_rel updater_rel
+    ts="$(date '+%Y%m%d-%H%M%S')"
+    backup_file="${BACKUP_DIR}/adguardhome-backup-${ts}.tar.gz"
+    BACKUP_FILE_CREATED="$backup_file"
+    tmp_manifest="${TMP_DIR}/backup-manifest-${ts}.txt"
+    manifest="tmp/adguardhome-updater/backup-manifest-${ts}.txt"
+
+    init_rel="${AGH_INIT#/}"
+    updater_rel="usr/bin/${SCRIPT_NAME}"
+
+    {
+        echo "SCRIPT_VERSION=${SCRIPT_VERSION}"
+        echo "AGH_DIR=${AGH_DIR}"
+        echo "AGH_BINARY=${AGH_BINARY}"
+        echo "AGH_CONFIG=${AGH_CONFIG}"
+        echo "AGH_INIT=${AGH_INIT}"
+        echo "BACKUP_CREATED=$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$tmp_manifest"
+
+    if [ -f "/usr/bin/${SCRIPT_NAME}" ]; then
+        tar czf "$backup_file" -C / \
+            "${AGH_DIR#/}" \
+            "$init_rel" \
+            "$updater_rel" \
+            "$manifest" 2>/dev/null
+    else
+        tar czf "$backup_file" -C / \
+            "${AGH_DIR#/}" \
+            "$init_rel" \
+            "$manifest" 2>/dev/null
+    fi
+
+    rm -f "$tmp_manifest"
+
+    [ -s "$backup_file" ] || die "Backup failed. Aborting before making changes."
+    ui_ok "Backup created: ${backup_file}"
+
+    local backup_count
+    backup_count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l)"
+    if [ "$backup_count" -gt 3 ]; then
+        ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz | tail -n +4 | xargs rm -f
+        ui_step "Old backups pruned, keeping last 3."
+    fi
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Download
+# ──────────────────────────────────────────────────────────────
+
+download_release() {
+    mkdir -p "$TMP_DIR" "$TMP_EXTRACT"
+    rm -rf "${TMP_EXTRACT:?}/"*
+
+    local tarball_name download_url
+    tarball_name="AdGuardHome_linux_${AGH_ARCH}.tar.gz"
+    download_url="${AGH_DOWNLOAD_BASE}/${LATEST_VERSION}/${tarball_name}"
+
+    ui_step "Downloading: ${download_url}"
+    wget -q -O "$TMP_TARBALL" "$download_url"
+    [ -s "$TMP_TARBALL" ] || die "Download failed or empty file: ${TMP_TARBALL}"
+    ui_ok "Download complete."
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Service control
+# ──────────────────────────────────────────────────────────────
+
+service_stop_agh() {
+    ui_step "Stopping AdGuardHome..."
+    "$AGH_INIT" stop 2>/dev/null
+    sleep 2
+
+    if pidof AdGuardHome >/dev/null 2>&1; then
+        ui_warn "AdGuardHome still running after stop, killing..."
+        killall AdGuardHome 2>/dev/null
+        sleep 2
+    fi
+
+    if pidof AdGuardHome >/dev/null 2>&1; then
+        ui_warn "AdGuardHome still running, force killing..."
+        killall -9 AdGuardHome 2>/dev/null
+        sleep 1
+    fi
+}
+
+service_start_agh() {
+    ui_step "Starting AdGuardHome..."
+    "$AGH_INIT" start 2>/dev/null
+    sleep 5
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Health check
+# ──────────────────────────────────────────────────────────────
+
+verify_dns_health() {
+    local dns_port="$1"
+    [ -n "$dns_port" ] || dns_port="3053"
+
+    if ! pidof AdGuardHome >/dev/null 2>&1; then
+        ui_err "AdGuardHome process is not running."
+        return 1
+    fi
+    ui_ok "AdGuardHome process is running."
+
+    if netstat -tulnp 2>/dev/null | grep -q ":${dns_port}[[:space:]]" || \
+       ss -tulnp 2>/dev/null | grep -q ":${dns_port}[[:space:]]"; then
+        ui_ok "AdGuardHome is listening on port ${dns_port}."
+    else
+        ui_err "AdGuardHome is not listening on port ${dns_port}."
+        return 1
+    fi
+
+    ui_step "Testing DNS resolution against 127.0.0.1:${dns_port}..."
+    local test_host i
+    for i in 1 2 3; do
+        for test_host in cloudflare.com google.com; do
+            if nslookup "$test_host" "127.0.0.1:${dns_port}" >/dev/null 2>&1 || \
+               nslookup "$test_host" "127.0.0.1" -port="$dns_port" >/dev/null 2>&1; then
+                ui_ok "DNS resolution OK: ${test_host}"
+                return 0
+            fi
+        done
+        sleep 2
+    done
+
+    ui_err "DNS resolution failed against 127.0.0.1:${dns_port}."
+    return 1
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Install
+# ──────────────────────────────────────────────────────────────
+
+install_binary() {
+    ui_step "Extracting tarball..."
+    tar xzf "$TMP_TARBALL" -C "$TMP_EXTRACT"
+    [ $? -eq 0 ] || die "Extraction failed."
+
+    local extracted_bin
+    extracted_bin="${TMP_EXTRACT}/AdGuardHome/AdGuardHome"
+    [ -f "$extracted_bin" ] || die "Extracted binary not found at: ${extracted_bin}"
+
+    service_stop_agh
+
+    ui_step "Installing new binary to ${AGH_BINARY}..."
+    cp "$extracted_bin" "$AGH_BINARY"
+    chmod +x "$AGH_BINARY"
+
+    service_start_agh
+
+    local dns_port
+    dns_port="$(get_dns_port)"
+    if ! verify_dns_health "$dns_port"; then
+        ui_err "Post-update health check failed. Attempting rollback..."
+        restore_from_backup
+        die "Install failed. Backup restore attempted. Check logs."
+    fi
+
+    ui_ok "AdGuardHome started and passed DNS health checks."
+}
+
+restore_from_backup() {
+    local latest_backup dns_port
+    latest_backup="$(ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | head -1)"
+    [ -n "$latest_backup" ] || {
+        ui_err "No backup found in ${BACKUP_DIR}. Manual recovery required."
+        return 1
+    }
+
+    ui_step "Restoring from: ${latest_backup}"
+    tar xzf "$latest_backup" -C /
+    [ $? -eq 0 ] || {
+        ui_err "Backup extraction failed."
+        return 1
+    }
+
+    chmod +x "$AGH_BINARY" 2>/dev/null
+    chmod +x "$AGH_INIT" 2>/dev/null
+
+    service_start_agh
+    dns_port="$(get_dns_port)"
+    verify_dns_health "$dns_port"
+}
+
+verify_install() {
+    local installed_version dns_port
+    installed_version="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+
+    if [ "$installed_version" = "$LATEST_VERSION" ]; then
+        ui_ok "Version confirmed: ${installed_version}"
+    else
+        ui_warn "Installed version (${installed_version:-unknown}) does not match expected (${LATEST_VERSION})."
+    fi
+
+    dns_port="$(get_dns_port)"
+    verify_dns_health "$dns_port" || ui_warn "Manual DNS verification recommended."
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# sysupgrade persistence
+# ──────────────────────────────────────────────────────────────
+
+ensure_sysupgrade_persistence() {
+    local conf="/etc/sysupgrade.conf"
+    touch "$conf"
+
+    ui_step "Ensuring sysupgrade persistence in ${conf}..."
+    for entry in "${AGH_DIR}/" "$AGH_INIT" "/usr/bin/${SCRIPT_NAME}" "${BACKUP_DIR}/"; do
+        if ! grep -qxF "$entry" "$conf" 2>/dev/null; then
+            printf '%s\n' "$entry" >> "$conf"
+            ui_step "Added: ${entry}"
+        fi
+    done
+    ui_ok "sysupgrade.conf updated."
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Backup management
+# ──────────────────────────────────────────────────────────────
+
+list_backups() {
+    ui_step "Available backups in ${BACKUP_DIR}:"
+    local found=0 f size
+    for f in "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz; do
+        if [ -f "$f" ]; then
+            size="$(du -sh "$f" 2>/dev/null | cut -f1)"
+            printf "  %s  (%s)\n" "$f" "$size"
+            found=1
+        fi
+    done
+    [ "$found" -eq 1 ] || ui_warn "No backups found in ${BACKUP_DIR}."
+}
+
+safe_backup_path_or_die() {
+    local target="$1"
+    case "$target" in
+        "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz) ;;
+        *) die "Refusing path outside backup directory: ${target}" ;;
+    esac
+    [ -f "$target" ] || die "Backup file not found: ${target}"
+}
+
+do_delete_backup() {
+    local target="$1"
+
+    if [ "$target" = "all" ]; then
+        local count
+        count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l)"
+        [ "$count" -gt 0 ] || {
+            ui_warn "No backups found in ${BACKUP_DIR}."
+            return
+        }
+        ui_warn "This will delete all ${count} backup(s) in ${BACKUP_DIR}."
+        printf "Are you sure? Type 'yes' to confirm: "
+        read -r confirm
+        [ "$confirm" = "yes" ] || {
+            ui_step "Aborted. No backups deleted."
+            return
+        }
+        rm -f "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz
+        ui_ok "All backups deleted."
+    else
+        safe_backup_path_or_die "$target"
+        rm -f "$target"
+        ui_ok "Deleted: ${target}"
+    fi
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Rollback
+# ──────────────────────────────────────────────────────────────
+
+do_rollback() {
+    local target_backup="$1"
+    preflight_common
+
+    if [ -n "$target_backup" ]; then
+        safe_backup_path_or_die "$target_backup"
+    else
+        target_backup="$(ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | head -1)"
+        [ -n "$target_backup" ] || die "No backups found in ${BACKUP_DIR}. Cannot rollback."
+    fi
+
+    hr
+    ui_step "Rolling back using: ${target_backup}"
+
+    local backup_version backup_bin
+    backup_bin="$(tar tzf "$target_backup" 2>/dev/null | grep '/AdGuardHome$' | head -1)"
+    if [ -n "$backup_bin" ]; then
+        backup_version="$(tar xzf "$target_backup" -O "$backup_bin" 2>/dev/null | strings 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        [ -n "$backup_version" ] && ui_step "Backup contains version: ${backup_version}"
+    fi
+
+    service_stop_agh
+
+    ui_step "Extracting backup..."
+    tar xzf "$target_backup" -C /
+    [ $? -eq 0 ] || die "Extraction of backup failed. Manual recovery required."
+
+    chmod +x "$AGH_BINARY" 2>/dev/null
+    chmod +x "$AGH_INIT" 2>/dev/null
+
+    service_start_agh
+
+    local dns_port
+    dns_port="$(get_dns_port)"
+    if verify_dns_health "$dns_port"; then
+        hr
+        ui_ok "Rollback complete. AdGuardHome is running and resolving DNS."
+        show_web_access_url
+        printf '\n'
+    else
+        die "AdGuardHome did not pass health checks after rollback. Manual recovery required."
+    fi
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Migration: package-managed to standalone binary
+# ──────────────────────────────────────────────────────────────
+
+detect_agh_package_name() {
+    AGH_PKG_NAME=""
+    case "$PKG_MANAGER" in
+        apk)
+            for pkg in adguardhome adguard-home; do
+                if apk info 2>/dev/null | grep -qx "$pkg"; then
+                    AGH_PKG_NAME="$pkg"
+                    return 0
+                fi
+            done
+            ;;
+        opkg)
+            for pkg in adguardhome adguard-home; do
+                if opkg list-installed 2>/dev/null | awk '{print $1}' | grep -qx "$pkg"; then
+                    AGH_PKG_NAME="$pkg"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+validate_migration_preconditions() {
+    case "$PKG_MANAGER" in
+        apk|opkg) ;;
+        *) die "Migration mode only supports apk or opkg-managed routers." ;;
+    esac
+
+    detect_agh_package_name || \
+        die "AdGuardHome does not appear to be package-managed by ${PKG_MANAGER}."
+
+    [ -n "$AGH_CONFIG" ] || \
+        die "No AdGuardHome config found in ${AGH_DIR}. Cannot safely migrate without existing config."
+
+    [ -x "$AGH_INIT" ] || \
+        die "Init script not found or not executable: ${AGH_INIT}"
+
+    [ "$CONFIRMED_LAN" -eq 1 ] || \
+        die "Migration requires --yes-i-have-lan-access. DNS will drop briefly. Only run this with LAN or physical access."
+
+    ui_ok "Migration preconditions passed."
+}
+
+interactive_migration_summary() {
+    hr
+    printf '\n'
+
+    local pkg_version
+    case "$PKG_MANAGER" in
+        apk)
+            pkg_version="$(apk list --installed 2>/dev/null | grep -i "^${AGH_PKG_NAME}" | awk '{print $1}' | head -1)"
+            ;;
+        opkg)
+            pkg_version="$(opkg list-installed 2>/dev/null | grep -i "^${AGH_PKG_NAME}" | awk '{print $1, $3}' | head -1)"
+            ;;
+    esac
+
+    box \
+        "Current install:   ${PKG_MANAGER}-managed (${pkg_version:-unknown})" \
+        "Target install:    standalone upstream binary" \
+        "Latest upstream:   ${LATEST_VERSION}" \
+        "Install directory: ${AGH_DIR}" \
+        "Config:            ${AGH_CONFIG}" \
+        "Init script:       ${AGH_INIT}" \
+        "Architecture:      $(uname -m) -> ${AGH_ARCH}"
+
+    printf '\n'
+    ui_warn "This will convert AdGuardHome from a ${PKG_MANAGER} package to a standalone upstream binary."
+    ui_warn "DNS will briefly stop during migration."
+    ui_warn "After migration, do not update AdGuardHome with ${PKG_MANAGER}."
+    ui_warn "Future updates should use this updater."
+    ui_warn "Node config, blocklists, and query logs will be preserved."
+    printf '\n'
+
+    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+        ui_step "Non-interactive migration confirmed by --yes-i-have-lan-access."
+        return 0
+    fi
+
+    while true; do
+        printf "${C_CYAN}> Are you sure you want to migrate? (y/N) ${C_RESET}"
+        read -r answer
+        [ -n "$answer" ] || answer="n"
+        case "$answer" in
+            y|Y|yes|YES) break ;;
+            n|N|no|NO) die "Migration aborted by user." ;;
+            *) ui_warn "Please answer y or n." ;;
+        esac
+    done
+    printf '\n'
+}
+
+remove_package_managed_agh() {
+    ui_step "Removing ${PKG_MANAGER} package: ${AGH_PKG_NAME}"
+    case "$PKG_MANAGER" in
+        apk)
+            apk del "$AGH_PKG_NAME" || die "Failed to remove apk package: ${AGH_PKG_NAME}"
+            ;;
+        opkg)
+            opkg remove "$AGH_PKG_NAME" || die "Failed to remove opkg package: ${AGH_PKG_NAME}"
+            ;;
+    esac
+}
+
+confirm_pkg_removed() {
+    case "$PKG_MANAGER" in
+        apk)
+            if apk info 2>/dev/null | grep -qx "$AGH_PKG_NAME"; then
+                ui_warn "${PKG_MANAGER} still shows ${AGH_PKG_NAME} as installed. Check manually: apk info | grep -i adguard"
+            else
+                ui_ok "Confirmed: AdGuardHome is no longer ${PKG_MANAGER}-managed."
+            fi
+            ;;
+        opkg)
+            if opkg list-installed 2>/dev/null | awk '{print $1}' | grep -qx "$AGH_PKG_NAME"; then
+                ui_warn "${PKG_MANAGER} still shows ${AGH_PKG_NAME} as installed. Check manually: opkg list-installed | grep -i adguard"
+            else
+                ui_ok "Confirmed: AdGuardHome is no longer ${PKG_MANAGER}-managed."
+            fi
+            ;;
+    esac
+}
+
+do_migrate_from_package() {
+    ui_step "Starting migration: ${PKG_MANAGER}-managed -> standalone binary"
+    printf '\n'
+
+    # Full backup before touching anything
+    backup_current
+
+    # Download upstream binary before removing package
+    download_release
+
+    service_stop_agh
+
+    remove_package_managed_agh
+
+    # Restore the full AGH directory and init script from backup immediately
+    # after package removal. The package manager may have removed more than
+    # just the binary (data files, filters, query logs). This guarantees full
+    # preservation. The upstream binary will overwrite the restored old binary next.
+    ui_step "Restoring preserved config and data from backup..."
+    tar xzf "$BACKUP_FILE_CREATED" -C / || die "Failed to restore backup after package removal."
+    chmod +x "$AGH_INIT" 2>/dev/null
+    ui_ok "Config and data restored."
+
+    # Install upstream binary
+    ui_step "Installing upstream binary to ${AGH_BINARY}..."
+    local extracted_bin="${TMP_EXTRACT}/AdGuardHome/AdGuardHome"
+    [ -f "$extracted_bin" ] || die "Extracted binary not found at: ${extracted_bin}"
+    mkdir -p "$AGH_DIR"
+    cp "$extracted_bin" "$AGH_BINARY" || die "Failed to install binary."
+    chmod +x "$AGH_BINARY"
+    ui_ok "Binary installed: ${AGH_BINARY}"
+
+    service_start_agh
+
+    local dns_port
+    dns_port="$(get_dns_port)"
+    if ! verify_dns_health "$dns_port"; then
+        ui_err "Health check failed after migration. Attempting rollback..."
+        restore_from_backup
+        die "Migration failed. Backup restored. Check logs."
+    fi
+
+    printf '\n'
+    confirm_pkg_removed
+
+    [ "$PERSIST_SYSUPGRADE" -eq 1 ] && ensure_sysupgrade_persistence
+    cleanup
+
+    hr
+    ui_ok "Migration complete. AdGuardHome ${LATEST_VERSION} is now running as a standalone binary."
+    show_web_access_url
+    ui_step "Future updates: ${SCRIPT_NAME}"
+    ui_step "Rollback if needed: ${SCRIPT_NAME} --rollback"
+    printf '\n'
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+    setup_colors
+
+    hr
+    ui_step "${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    hr
+    printf '\n'
+
+    if [ "$LIST_BACKUPS" -eq 1 ]; then
+        list_backups
+        exit 0
+    fi
+
+    if [ -n "$DELETE_BACKUP" ]; then
+        do_delete_backup "$DELETE_BACKUP"
+        exit 0
+    fi
+
+    if [ "$ROLLBACK" -eq 1 ]; then
+        do_rollback "$ROLLBACK_FILE"
+        exit 0
+    fi
+
+    if [ "$MIGRATE_FROM_PACKAGE" -eq 1 ]; then
+        require_root_openwrt
+        detect_agh_install
+        detect_pkg_manager
+        detect_arch
+        get_latest_version
+
+        local free_kb free_mb
+        free_kb="$(df /tmp | awk 'NR==2 {print $4}')"
+        free_mb=$(( free_kb / 1024 ))
+        [ "$free_mb" -ge "$MIN_FREE_MB" ] || die "Insufficient free space in /tmp. Need ${MIN_FREE_MB} MB, have ${free_mb} MB."
+
+        validate_migration_preconditions
+        get_current_version
+        interactive_migration_summary
+        do_migrate_from_package
+        exit 0
+    fi
+
+    preflight_update
+    interactive_preflight_display
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        hr
+        ui_step "Dry run only. No changes made."
+        box \
+            "Install directory: ${AGH_DIR}" \
+            "Binary:            ${AGH_BINARY}" \
+            "Config:            ${AGH_CONFIG:-not found}" \
+            "DNS port:          $(get_dns_port)" \
+            "Current version:   ${CURRENT_VERSION}" \
+            "Latest version:    ${LATEST_VERSION}" \
+            "Arch tarball:      AdGuardHome_linux_${AGH_ARCH}.tar.gz"
+        printf '\n'
+        if is_update_needed; then
+            ui_step "Update available: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+        else
+            ui_ok "Already on latest version (${CURRENT_VERSION})."
+        fi
+        printf '\n'
+        exit 0
+    fi
+
+    if ! is_update_needed; then
+        ui_ok "Already on latest version (${CURRENT_VERSION}). Use --force to reinstall."
+        [ "$PERSIST_SYSUPGRADE" -eq 1 ] && ensure_sysupgrade_persistence
+        exit 0
+    fi
+
+    interactive_update_summary
+
+    ui_step "Update: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+    printf '\n'
+
+    backup_current
+    download_release
+    install_binary
+    verify_install
+    [ "$PERSIST_SYSUPGRADE" -eq 1 ] && ensure_sysupgrade_persistence
+    cleanup
+
+    hr
+    ui_ok "AdGuardHome updated to ${LATEST_VERSION}."
+    show_web_access_url
+    ui_step "Rollback if needed: ${SCRIPT_NAME} --rollback"
+    printf '\n'
+}
+
+main "$@"
