@@ -64,6 +64,16 @@ wget -q https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater
 
 ## Usage
 
+### Interactive menu
+
+Run with no flags in a terminal to open the interactive menu:
+
+```sh
+openwrt-adguardhome-updater
+```
+
+The menu shows a dashboard with router model, firmware, LAN IP, AdGuardHome version, web UI URL, current channel, and time. From the menu you can update, switch channels, rollback, manage backups, pick a theme, and view about info.
+
 ### Dry run first (always)
 
 ```sh
@@ -108,11 +118,18 @@ openwrt-adguardhome-updater --install-dir /opt/AdGuardHome
 
 | Flag | Description |
 |---|---|
-| *(no flags)* | Update to latest stable release |
+| *(no flags)* | Open interactive menu (when run in a terminal) |
 | `--dry-run` | Check current vs latest version, make no changes |
 | `--force` | Reinstall even if already on latest version |
+| `--yes` / `-y` | Assume yes to all prompts |
+| `--non-interactive` | Skip all prompts, use defaults |
+| `--no-persist` | Skip adding paths to `/etc/sysupgrade.conf` |
 | `--keep-tmp` | Do not delete `/tmp` download files after install |
 | `--install-dir <path>` | Override detected install directory |
+| `--channel <name>` | Set release channel: `release`, `beta`, `edge`, `development` |
+| `--reset-channel` | Reset saved channel to `release` |
+| `--theme <name>` | Set UI theme: `classic`, `green`, `amber`, `ocean`, `mono` |
+| `--reset-theme` | Reset saved theme to `classic` |
 | `--rollback` | Restore the latest backup |
 | `--rollback <file>` | Restore a specific backup file |
 | `--list-backups` | List available backups with sizes |
@@ -134,7 +151,8 @@ The script detects the AdGuardHome install in this order:
 
 1. `--install-dir` if provided
 2. Running process via `/proc/<pid>/exe` (most reliable)
-3. Probe of known locations: `/etc/AdGuardHome`, `/opt/AdGuardHome`, `/usr/local/AdGuardHome`, `/usr/bin`
+3. Probe of known locations: `/etc/AdGuardHome`, `/opt/AdGuardHome`, `/usr/local/AdGuardHome`
+4. `/usr/bin/AdGuardHome` as a standalone binary (warned, not treated as a directory install)
 
 The init script is detected from `/etc/init.d/adguardhome` or `/etc/init.d/AdGuardHome`. The DNS port is read directly from `AdGuardHome.yaml` using the `dns.port` field, with a fallback to `3053` if the config is unreadable.
 
@@ -142,11 +160,12 @@ The init script is detected from `/etc/init.d/adguardhome` or `/etc/init.d/AdGua
 
 1. Preflight: root check, OpenWrt check, install detection, package-manager guard, dependency check, free space check, arch detection, version fetch
 2. Backup: full `AGH_DIR` + init script + updater script archived to `/root/adguardhome-updater/backups/`, keeping last 3
-3. Download: `AdGuardHome_linux_<arch>.tar.gz` from AdGuard's official GitHub releases
+3. Download: `AdGuardHome_linux_<arch>.tar.gz` from the selected channel
 4. Install: stop service, replace binary, start service
-5. Health check: process running + port listening + DNS resolution test (3 retries, 2s apart)
-6. Auto-rollback: if health check fails, the latest backup is restored automatically
-7. sysupgrade persistence: key paths added to `/etc/sysupgrade.conf`
+5. Health check: process running + port listening (authoritative). DNS resolution test is best-effort only and will not trigger rollback on WAN/upstream issues.
+6. Auto-rollback: if process or port check fails, the latest backup is restored automatically
+7. Channel save: selected channel is persisted to `/root/adguardhome-updater/channel.conf`
+8. sysupgrade persistence: key paths added to `/etc/sysupgrade.conf`
 
 ### Backup contents
 
@@ -217,10 +236,12 @@ The script automatically adds the detected paths to `/etc/sysupgrade.conf` on ea
 <detected AGH_DIR>/          e.g. /etc/AdGuardHome/ or /opt/AdGuardHome/
 <detected init script>       e.g. /etc/init.d/adguardhome
 /usr/bin/openwrt-adguardhome-updater
-/root/adguardhome-updater/backups/
+/root/adguardhome-updater/
 ```
 
-This ensures the AdGuardHome install, config, updater script, and backups survive a firmware upgrade.
+The full state directory `/root/adguardhome-updater/` is persisted, which covers backups, saved channel (`channel.conf`), and saved theme (`theme.conf`).
+
+This ensures the AdGuardHome install, config, updater script, backups, and preferences survive a firmware upgrade.
 
 > After a sysupgrade, run `--dry-run` again to confirm everything is intact before the next update.
 
@@ -250,11 +271,27 @@ openwrt-adguardhome-updater
 
 ---
 
-## Roadmap
+## Channels
 
-A future installer mode may support first-time AdGuardHome setup, including dnsmasq port migration, DHCP and DHCPv6 DNS advertisement, and optional loopback or GUA DNS binding. This is intentionally out of scope for v0.1.0.
+The default channel is `release`. Select a channel from the interactive menu or via `--channel`.
 
-Checksum verification for downloaded release tarballs is also planned for a future release.
+| Channel | Source | Notes |
+|---|---|---|
+| `release` | GitHub Releases API + GitHub release assets | Stable, recommended |
+| `beta` | `static.adtidy.org/adguardhome/beta/` | Pre-release, not for production |
+| `edge` | `static.adtidy.org/adguardhome/edge/` | Development builds, not for production |
+| `development` | `static.adtidy.org/adguardhome/development/` | Highly experimental |
+
+For `release`, the script reads the latest version from the GitHub API and downloads the matching release asset.
+
+For `beta`, `edge`, and `development`, the script downloads the latest channel tarball directly from AdGuard's static server. `version.json` is fetched as a best-effort for version display only. If it is unavailable, the updater still proceeds with the download.
+
+```sh
+# CLI channel selection
+openwrt-adguardhome-updater --channel beta --dry-run
+openwrt-adguardhome-updater --channel edge --dry-run
+openwrt-adguardhome-updater --channel development --dry-run
+```
 
 ---
 
