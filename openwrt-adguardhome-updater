@@ -26,8 +26,15 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.05.22.04"
+SCRIPT_VERSION="2026.05.24.01"
 SCRIPT_NAME="openwrt-adguardhome-updater"
+
+STATE_DIR="/root/adguardhome-updater"
+THEME_FILE="${STATE_DIR}/theme.conf"
+THEME_NAME="classic"
+CHANNEL_FILE="${STATE_DIR}/channel.conf"
+CHANNEL="release"
+DETECTED_CHANNEL="unknown"
 
 AGH_DIR=""
 AGH_BINARY=""
@@ -35,10 +42,11 @@ AGH_INIT=""
 AGH_CONFIG=""
 AGH_RELEASES_URL="https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest"
 AGH_DOWNLOAD_BASE="https://github.com/AdguardTeam/AdGuardHome/releases/download"
+AGH_STATIC_BASE="https://static.adtidy.org/adguardhome"
 
 INSTALL_DIR_OVERRIDE=""
 
-BACKUP_DIR="/root/adguardhome-updater/backups"
+BACKUP_DIR="${STATE_DIR}/backups"
 TMP_DIR="/tmp/adguardhome-updater"
 TMP_TARBALL="${TMP_DIR}/AdGuardHome.tar.gz"
 TMP_EXTRACT="${TMP_DIR}/extract"
@@ -69,37 +77,125 @@ FREE_MB=0
 
 
 # ──────────────────────────────────────────────────────────────
-# UI helpers
+# Theme system
 # ──────────────────────────────────────────────────────────────
 
-setup_colors() {
-    if [ -t 1 ]; then
-        C_RESET='\033[0m'
-        C_RED='\033[0;31m'
-        C_GREEN='\033[0;32m'
-        C_YELLOW='\033[0;33m'
-        C_CYAN='\033[0;36m'
-        C_DIM='\033[0;37m'
-        C_BOLD='\033[1m'
-    else
-        C_RESET=''
-        C_RED=''
-        C_GREEN=''
-        C_YELLOW=''
-        C_CYAN=''
-        C_DIM=''
-        C_BOLD=''
+C_RESET=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_DIM=''; C_BOLD=''
+UI_BAR=''; UI_KEY=''; UI_TITLE=''; UI_HINT=''
+USE_UNICODE=0
+
+theme_is_valid() {
+    case "$1" in
+        classic|green|amber|ocean|mono) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+theme_can_color() {
+    [ -t 1 ] || return 1
+    [ "${TERM:-dumb}" = "dumb" ] && return 1
+    [ -n "${NO_COLOR:-}" ] && return 1
+    return 0
+}
+
+theme_apply() {
+    local requested="$1"
+    local render="$requested"
+    if [ "$render" != "mono" ] && ! theme_can_color; then
+        render="mono"
     fi
 
     case "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" in
-        *UTF-8*|*utf-8*|*utf8*)
-            USE_UNICODE=1
+        *UTF-8*|*utf-8*|*utf8*) USE_UNICODE=1 ;;
+        *) USE_UNICODE=0 ;;
+    esac
+
+    case "$render" in
+        green)
+            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'
+            C_YELLOW='\033[1;33m'; C_CYAN='\033[0;36m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
+            UI_BAR='\033[30;42m'; UI_KEY='\033[30;41m'; UI_TITLE='\033[1;37m'; UI_HINT='\033[0;36m'
             ;;
-        *)
-            USE_UNICODE=0
+        amber)
+            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;33m'
+            C_YELLOW='\033[1;33m'; C_CYAN='\033[0;33m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
+            UI_BAR='\033[30;43m'; UI_KEY='\033[30;47m'; UI_TITLE='\033[1;33m'; UI_HINT='\033[0;33m'
+            ;;
+        ocean)
+            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;36m'
+            C_YELLOW='\033[1;36m'; C_CYAN='\033[1;34m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
+            UI_BAR='\033[37;44m'; UI_KEY='\033[30;46m'; UI_TITLE='\033[1;36m'; UI_HINT='\033[0;36m'
+            ;;
+        mono)
+            C_RESET=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_DIM=''; C_BOLD=''
+            UI_BAR=''; UI_KEY=''; UI_TITLE=''; UI_HINT=''
+            ;;
+        classic|*)
+            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'
+            C_YELLOW='\033[0;33m'; C_CYAN='\033[0;36m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
+            UI_BAR='\033[30;47m'; UI_KEY='\033[37;44m'; UI_TITLE='\033[1m'; UI_HINT='\033[0;37m'
             ;;
     esac
 }
+
+theme_load() {
+    THEME_NAME="classic"
+    [ -f "$THEME_FILE" ] || return 0
+    local saved
+    saved="$(sed -n 's/^THEME=//p' "$THEME_FILE" | head -n 1)"
+    theme_is_valid "$saved" && THEME_NAME="$saved"
+}
+
+theme_save() {
+    mkdir -p "$STATE_DIR"
+    printf 'THEME=%s\n' "$THEME_NAME" > "$THEME_FILE"
+}
+
+theme_init() {
+    theme_load
+    theme_apply "$THEME_NAME"
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Channel persistence
+# ──────────────────────────────────────────────────────────────
+
+channel_is_valid() {
+    case "$1" in
+        release|beta|edge|development) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+channel_load() {
+    CHANNEL="release"
+    [ -f "$CHANNEL_FILE" ] || return 0
+    local saved
+    saved="$(sed -n 's/^CHANNEL=//p' "$CHANNEL_FILE" | head -n 1)"
+    channel_is_valid "$saved" && CHANNEL="$saved"
+}
+
+channel_save() {
+    mkdir -p "$STATE_DIR"
+    printf 'CHANNEL=%s\n' "$CHANNEL" > "$CHANNEL_FILE"
+}
+
+detect_channel_from_version() {
+    local ver="$1"
+    case "$ver" in
+        *-b.*|*beta*)       echo "beta" ;;
+        *edge*)             echo "edge" ;;
+        *dev*|*development*) echo "development" ;;
+        v[0-9]*.[0-9]*.[0-9]*) echo "release" ;;
+        *)                  echo "unknown" ;;
+    esac
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# UI helpers
+# ──────────────────────────────────────────────────────────────
 
 is_tty() {
     [ -t 0 ] && [ -t 1 ]
@@ -117,56 +213,50 @@ box() {
     if [ "${USE_UNICODE:-0}" -eq 1 ]; then
         printf '┌──────────────────────────────────────────────────────────────────┐\n'
         while [ $# -gt 0 ]; do
-            printf '│ %-68s │\n' "$1"
-            shift
+            printf '│ %-68s │\n' "$1"; shift
         done
         printf '└──────────────────────────────────────────────────────────────────┘\n'
     else
         printf '+------------------------------------------------------------------+\n'
         while [ $# -gt 0 ]; do
-            printf '| %-64s |\n' "$1"
-            shift
+            printf '| %-64s |\n' "$1"; shift
         done
         printf '+------------------------------------------------------------------+\n'
     fi
 }
 
-ui_ok() {
-    printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"
+ui_ok()   { printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"; }
+ui_warn() { printf "${C_YELLOW}[!]${C_RESET} %s\n" "$*"; }
+ui_step() { printf "${C_DIM}[->]${C_RESET} %s\n" "$*"; }
+ui_err()  { printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*"; }
+
+ui_section_bar() {
+    if [ -n "$UI_BAR" ]; then
+        printf "${UI_BAR} %-68s ${C_RESET}\n" "$1"
+    else
+        printf '== %s ==\n' "$1"
+    fi
 }
 
-ui_warn() {
-    printf "${C_YELLOW}[!]${C_RESET} %s\n" "$*"
-}
-
-ui_step() {
-    printf "${C_DIM}[->]${C_RESET} %s\n" "$*"
-}
-
-ui_err() {
-    printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*"
+ui_menu_item() {
+    local key="$1" text="$2" hint="${3:-}"
+    if [ -n "$UI_KEY" ]; then
+        printf "  ${UI_KEY} %s ${C_RESET}  %s" "$key" "$text"
+    else
+        printf "  [%s]  %s" "$key" "$text"
+    fi
+    [ -n "$hint" ] && printf "  ${C_DIM}%s${C_RESET}" "$hint"
+    printf '\n'
 }
 
 confirm() {
-    local question="$1"
-    local default="${2:-n}"
-    local answer prompt
+    local question="$1" default="${2:-n}" answer prompt
 
-    if [ "$ASSUME_YES" -eq 1 ]; then
-        return 0
-    fi
-
+    [ "$ASSUME_YES" -eq 1 ] && return 0
     if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-        [ "$default" = "y" ] && return 0
-        return 1
+        [ "$default" = "y" ] && return 0; return 1
     fi
-
-    if [ "$default" = "y" ]; then
-        prompt="Y/n"
-    else
-        prompt="y/N"
-    fi
-
+    [ "$default" = "y" ] && prompt="Y/n" || prompt="y/N"
     while true; do
         printf "${C_CYAN}> %s (%s) ${C_RESET}" "$question" "$prompt"
         read -r answer
@@ -180,8 +270,7 @@ confirm() {
 }
 
 log() {
-    local level="$1"
-    shift
+    local level="$1"; shift
     local msg="$*"
     case "$level" in
         INFO)    ui_step "$msg" ;;
@@ -221,6 +310,9 @@ Usage: ${SCRIPT_NAME} [options]
   --no-persist            Skip adding paths to /etc/sysupgrade.conf
   --keep-tmp              Do not delete /tmp download files after install
   --install-dir <path>    Override detected install directory
+  --channel <name>        Set release channel: release, beta, edge, development (default: release)
+  --reset-channel         Reset saved channel to release
+  --reset-theme           Reset saved theme to classic
   --rollback              Restore the latest backup
   --rollback <file>       Restore a specific backup file
   --list-backups          List available backups
@@ -249,9 +341,37 @@ parse_args() {
             --dry-run)         DRY_RUN=1 ;;
             --force)           FORCE=1 ;;
             --keep-tmp)        KEEP_TMP=1 ;;
+            --channel)
+                [ -n "$2" ] || die "--channel requires a value: release, beta, edge, development"
+                case "$2" in
+                    release|beta|edge|development) CHANNEL="$2" ;;
+                    *) die "Unknown channel: $2. Valid channels: release, beta, edge, development" ;;
+                esac
+                shift
+                ;;
+            --reset-channel)
+                CHANNEL="release"
+                channel_save
+                ui_ok "Channel reset to release."
+                ;;
             --yes|-y)          ASSUME_YES=1 ;;
             --non-interactive) NON_INTERACTIVE=1 ;;
             --no-persist)      PERSIST_SYSUPGRADE=0 ;;
+            --theme)
+                [ -n "$2" ] || die "--theme requires a value: classic, green, amber, ocean, mono"
+                theme_is_valid "$2" || die "Unknown theme: $2. Valid: classic, green, amber, ocean, mono"
+                THEME_NAME="$2"
+                theme_save
+                theme_apply "$THEME_NAME"
+                ui_ok "Theme set: ${THEME_NAME}"
+                shift
+                ;;
+            --reset-theme)
+                THEME_NAME="classic"
+                theme_save
+                theme_apply "classic"
+                ui_ok "Theme reset to classic."
+                ;;
             --list-backups)    LIST_BACKUPS=1 ;;
             --install-dir)
                 [ -n "$2" ] || die "--install-dir requires a path argument."
@@ -308,10 +428,22 @@ detect_arch() {
         i386|i486|i686|i786) AGH_ARCH="386" ;;
         riscv64)         AGH_ARCH="riscv64" ;;
         mips|mips64)
-            if grep -qiE "mips.*el|mipsel|mipsle" /proc/cpuinfo 2>/dev/null; then
-                AGH_ARCH="${cpu_arch}le_softfloat"
+            # Use hexdump for reliable endian detection (matches official install.sh)
+            local endian_result
+            if command -v hexdump >/dev/null 2>&1; then
+                endian_result="$(printf 'I' | hexdump -o | awk '{ print substr($2, 6, 1); exit; }')"
+                if [ "$endian_result" -eq 1 ] 2>/dev/null; then
+                    AGH_ARCH="${cpu_arch}le_softfloat"
+                else
+                    AGH_ARCH="${cpu_arch}_softfloat"
+                fi
             else
-                AGH_ARCH="${cpu_arch}_softfloat"
+                # Fallback to /proc/cpuinfo if hexdump unavailable
+                if grep -qiE "mips.*el|mipsel|mipsle" /proc/cpuinfo 2>/dev/null; then
+                    AGH_ARCH="${cpu_arch}le_softfloat"
+                else
+                    AGH_ARCH="${cpu_arch}_softfloat"
+                fi
             fi
             ;;
         mipsel) AGH_ARCH="mipsle_softfloat" ;;
@@ -337,13 +469,20 @@ detect_agh_install() {
         fi
 
         if [ -z "$AGH_DIR" ]; then
-            for candidate in /etc/AdGuardHome /opt/AdGuardHome /usr/local/AdGuardHome /usr/bin; do
+            for candidate in /etc/AdGuardHome /opt/AdGuardHome /usr/local/AdGuardHome; do
                 if [ -x "${candidate}/AdGuardHome" ]; then
                     AGH_DIR="$candidate"
                     AGH_BINARY="${AGH_DIR}/AdGuardHome"
                     break
                 fi
             done
+        fi
+
+        # Check /usr/bin/AdGuardHome as a standalone binary (not a dir-based install)
+        if [ -z "$AGH_DIR" ] && [ -x "/usr/bin/AdGuardHome" ]; then
+            AGH_BINARY="/usr/bin/AdGuardHome"
+            AGH_DIR="/usr/bin"
+            ui_warn "AdGuardHome found at /usr/bin/AdGuardHome. Use --install-dir if config is elsewhere."
         fi
 
         [ -n "$AGH_DIR" ] || die "Could not detect AdGuardHome install directory. Use --install-dir."
@@ -353,6 +492,9 @@ detect_agh_install() {
         AGH_CONFIG="${AGH_DIR}/AdGuardHome.yaml"
     elif [ -f "${AGH_DIR}/config.yaml" ]; then
         AGH_CONFIG="${AGH_DIR}/config.yaml"
+    elif [ -f "/etc/adguardhome.yaml" ]; then
+        # Fallback for opkg-style installs that place config at a flat path
+        AGH_CONFIG="/etc/adguardhome.yaml"
     fi
 
     local init_candidate
@@ -413,18 +555,40 @@ check_agh_pkg_managed() {
 get_current_version() {
     if [ ! -x "$AGH_BINARY" ]; then
         CURRENT_VERSION="not installed"
+        DETECTED_CHANNEL="unknown"
         return
     fi
-    CURRENT_VERSION="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    CURRENT_VERSION="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1)"
     [ -n "$CURRENT_VERSION" ] || CURRENT_VERSION="unknown"
+    DETECTED_CHANNEL="$(detect_channel_from_version "$CURRENT_VERSION")"
 }
 
 get_latest_version() {
-    local response
-    response="$(wget -q -O - "$AGH_RELEASES_URL" 2>/dev/null)"
-    [ -n "$response" ] || die "Failed to fetch latest release info from GitHub API."
-    LATEST_VERSION="$(printf '%s' "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')"
-    [ -n "$LATEST_VERSION" ] || die "Could not parse latest stable version from GitHub API response."
+    local response version_url
+
+    case "$CHANNEL" in
+        development|beta|edge)
+            # Best-effort version fetch. The official installer does not require
+            # version.json and downloads the channel tarball directly.
+            # If version.json is unavailable, fall back to the channel name.
+            version_url="${AGH_STATIC_BASE}/${CHANNEL}/version.json"
+            response="$(wget -q -O - "$version_url" 2>/dev/null || true)"
+            LATEST_VERSION="$(printf '%s' "$response" \
+                | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                | head -1 \
+                | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/".*//')"
+            [ -n "$LATEST_VERSION" ] || LATEST_VERSION="$CHANNEL"
+            ;;
+        release|*)
+            response="$(wget -q -O - "$AGH_RELEASES_URL" 2>/dev/null)"
+            [ -n "$response" ] || die "Failed to fetch latest release info from GitHub API."
+            LATEST_VERSION="$(printf '%s' "$response" \
+                | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                | head -1 \
+                | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')"
+            [ -n "$LATEST_VERSION" ] || die "Could not parse latest stable version from GitHub API response."
+            ;;
+    esac
 }
 
 get_dns_port() {
@@ -568,8 +732,18 @@ interactive_preflight_display() {
     ui_ok "Init script:       ${AGH_INIT}"
 
     printf '\n'
-    ui_ok "Current version: ${CURRENT_VERSION}"
-    ui_ok "Latest version:  ${LATEST_VERSION}"
+    ui_ok "Current version:   ${CURRENT_VERSION}"
+    ui_ok "Configured channel: ${CHANNEL}"
+    ui_ok "Detected build:    ${DETECTED_CHANNEL}"
+    ui_ok "Latest version:    ${LATEST_VERSION} (${CHANNEL})"
+    case "$LATEST_VERSION" in
+        beta|edge|development)
+            ui_warn "Exact ${CHANNEL} version could not be read. The updater will download the latest channel tarball."
+            ;;
+    esac
+    if [ "$DETECTED_CHANNEL" != "unknown" ] && [ "$DETECTED_CHANNEL" != "$CHANNEL" ]; then
+        ui_warn "Configured channel is ${CHANNEL}, but installed build looks like ${DETECTED_CHANNEL}."
+    fi
 
     printf '\n'
     ui_ok "Prerequisites met."
@@ -585,11 +759,17 @@ interactive_update_summary() {
         "Binary:            ${AGH_BINARY}" \
         "Config:            ${AGH_CONFIG:-not found}" \
         "Init script:       ${AGH_INIT}" \
+        "Channel:           ${CHANNEL}" \
         "Current version:   ${CURRENT_VERSION}" \
         "Latest version:    ${LATEST_VERSION}" \
         "DNS port:          $(get_dns_port)"
 
     printf '\n'
+    case "$CHANNEL" in
+        beta)        ui_warn "BETA channel selected. Not recommended for production routers." ;;
+        edge)        ui_warn "EDGE channel selected. These are development builds. Not for production use." ;;
+        development) ui_warn "DEVELOPMENT channel selected. Highly experimental. Not for production use." ;;
+    esac
     ui_warn "AdGuardHome will be stopped briefly during the update."
     ui_warn "DNS may be interrupted for clients during this time."
     ui_warn "A backup will be created before replacing the binary."
@@ -642,6 +822,15 @@ backup_current() {
     init_rel="${AGH_INIT#/}"
     updater_rel="usr/bin/${SCRIPT_NAME}"
 
+    # Safety guard: never archive /usr/bin wholesale. If AGH_DIR is /usr/bin,
+    # back up only the binary itself, not the entire directory.
+    local agh_dir_rel
+    if [ "$AGH_DIR" = "/usr/bin" ]; then
+        agh_dir_rel="usr/bin/AdGuardHome"
+    else
+        agh_dir_rel="${AGH_DIR#/}"
+    fi
+
     {
         echo "SCRIPT_VERSION=${SCRIPT_VERSION}"
         echo "AGH_DIR=${AGH_DIR}"
@@ -653,13 +842,13 @@ backup_current() {
 
     if [ -f "/usr/bin/${SCRIPT_NAME}" ]; then
         tar czf "$backup_file" -C / \
-            "${AGH_DIR#/}" \
+            "$agh_dir_rel" \
             "$init_rel" \
             "$updater_rel" \
             "$manifest" 2>/dev/null
     else
         tar czf "$backup_file" -C / \
-            "${AGH_DIR#/}" \
+            "$agh_dir_rel" \
             "$init_rel" \
             "$manifest" 2>/dev/null
     fi
@@ -688,8 +877,17 @@ download_release() {
 
     local tarball_name download_url
     tarball_name="AdGuardHome_linux_${AGH_ARCH}.tar.gz"
-    download_url="${AGH_DOWNLOAD_BASE}/${LATEST_VERSION}/${tarball_name}"
 
+    case "$CHANNEL" in
+        development|beta|edge)
+            download_url="${AGH_STATIC_BASE}/${CHANNEL}/${tarball_name}"
+            ;;
+        release|*)
+            download_url="${AGH_DOWNLOAD_BASE}/${LATEST_VERSION}/${tarball_name}"
+            ;;
+    esac
+
+    ui_step "Channel:    ${CHANNEL}"
     ui_step "Downloading: ${download_url}"
     wget -q -O "$TMP_TARBALL" "$download_url"
     [ -s "$TMP_TARBALL" ] || die "Download failed or empty file: ${TMP_TARBALL}"
@@ -748,21 +946,31 @@ verify_dns_health() {
         return 1
     fi
 
+    # DNS resolution test is best-effort only. A transient WAN/upstream issue
+    # should not trigger a rollback if the process is running and port is bound.
     ui_step "Testing DNS resolution against 127.0.0.1:${dns_port}..."
-    local test_host i
+    local test_host i resolved=0
     for i in 1 2 3; do
         for test_host in cloudflare.com google.com; do
             if nslookup "$test_host" "127.0.0.1:${dns_port}" >/dev/null 2>&1 || \
                nslookup "$test_host" "127.0.0.1" -port="$dns_port" >/dev/null 2>&1; then
                 ui_ok "DNS resolution OK: ${test_host}"
-                return 0
+                resolved=1
+                break 2
             fi
         done
         sleep 2
     done
 
-    ui_err "DNS resolution failed against 127.0.0.1:${dns_port}."
-    return 1
+    if [ "$resolved" -eq 0 ]; then
+        ui_warn "DNS resolution test failed against 127.0.0.1:${dns_port}."
+        ui_warn "This may be a transient upstream/WAN issue. Process is running and port is bound."
+        ui_warn "Verify DNS manually: nslookup cloudflare.com 127.0.0.1:${dns_port}"
+    fi
+
+    # Return success as long as process is running and port is listening.
+    # Resolution failure alone is not grounds for rollback.
+    return 0
 }
 
 
@@ -795,7 +1003,7 @@ install_binary() {
         die "Install failed. Backup restore attempted. Check logs."
     fi
 
-    ui_ok "AdGuardHome started and passed DNS health checks."
+    ui_ok "AdGuardHome process and listener passed health checks."
 }
 
 restore_from_backup() {
@@ -845,7 +1053,7 @@ ensure_sysupgrade_persistence() {
     touch "$conf"
 
     ui_step "Ensuring sysupgrade persistence in ${conf}..."
-    for entry in "${AGH_DIR}/" "$AGH_INIT" "/usr/bin/${SCRIPT_NAME}" "${BACKUP_DIR}/"; do
+    for entry in "${AGH_DIR}/" "$AGH_INIT" "/usr/bin/${SCRIPT_NAME}" "${STATE_DIR}/"; do
         if ! grep -qxF "$entry" "$conf" 2>/dev/null; then
             printf '%s\n' "$entry" >> "$conf"
             ui_step "Added: ${entry}"
@@ -1130,6 +1338,7 @@ do_migrate_from_package() {
     printf '\n'
     confirm_pkg_removed
 
+    channel_save
     [ "$PERSIST_SYSUPGRADE" -eq 1 ] && ensure_sysupgrade_persistence
     cleanup
 
@@ -1146,14 +1355,211 @@ do_migrate_from_package() {
 # Main
 # ──────────────────────────────────────────────────────────────
 
+render_dashboard() {
+    local model fw_ver lan_ip agh_ver now tz_posix gmt_label offset
+
+    tz_posix="$(uci get system.@system[0].timezone 2>/dev/null || true)"
+    gmt_label="UTC"
+    if [ -n "$tz_posix" ]; then
+        offset="$(printf '%s' "$tz_posix" | sed -n 's/^[A-Za-z]*\([+-][0-9]*\).*/\1/p')"
+        if [ -n "$offset" ]; then
+            case "$offset" in
+                -*) gmt_label="GMT+${offset#-}" ;;
+                +*) gmt_label="GMT-${offset#+}" ;;
+                *)  gmt_label="GMT" ;;
+            esac
+        fi
+        now="$(TZ="$tz_posix" date "+%a %b %d %Y %I:%M:%S %p $gmt_label" 2>/dev/null || true)"
+    fi
+    [ -n "$now" ] || now="$(date '+%a %b %d %Y %I:%M:%S %p UTC' 2>/dev/null || true)"
+    [ -n "$now" ] || now="time-unavailable"
+
+    model="$(cat /tmp/sysinfo/model 2>/dev/null || echo "unknown")"
+    fw_ver="$(grep DISTRIB_RELEASE /etc/openwrt_release 2>/dev/null | cut -d= -f2 | tr -d '"')"
+    [ -n "$fw_ver" ] || fw_ver="unknown"
+
+    lan_ip="$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null | xargs -I{} ip -4 addr show {} 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
+    [ -n "$lan_ip" ] || lan_ip="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
+    [ -n "$lan_ip" ] || lan_ip="unknown"
+
+    agh_ver="$(${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome} --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    [ -n "$agh_ver" ] || agh_ver="unknown"
+
+    local web_port
+    web_port="$(get_web_port)"
+
+    hr
+    printf '\n'
+    printf "  ${UI_TITLE}%s${C_RESET}\n" "$SCRIPT_NAME"
+    printf '\n'
+    printf "  Model:        %s\n" "$model"
+    printf "  Firmware:     OpenWrt %s\n" "$fw_ver"
+    printf "  LAN:          %s\n" "$lan_ip"
+    printf "  AdGuardHome:  %s\n" "$agh_ver"
+    printf "  Channel:      %s" "$CHANNEL"
+    local detected
+    detected="$(detect_channel_from_version "$agh_ver")"
+    if [ "$detected" != "unknown" ] && [ "$detected" != "$CHANNEL" ]; then
+        printf "  ${C_YELLOW}(installed build looks like: %s)${C_RESET}" "$detected"
+    fi
+    printf '\n'
+    if [ -n "$lan_ip" ] && [ "$lan_ip" != "unknown" ]; then
+        printf "  Web UI:       ${C_CYAN}http://%s:%s/${C_RESET}\n" "$lan_ip" "$web_port"
+    fi
+    printf "  Time:         %s\n" "$now"
+    printf "  Theme:        %s\n" "$THEME_NAME"
+    printf '\n'
+}
+
+show_about() {
+    local backup_count agh_ver
+
+    backup_count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+    agh_ver="$(${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome} --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    [ -n "$agh_ver" ] || agh_ver="unknown"
+
+    hr
+    printf '\n'
+    ui_section_bar "About ${SCRIPT_NAME}"
+    printf '\n'
+    printf "  Script version: %s\n" "$SCRIPT_VERSION"
+    printf "  AdGuardHome:    %s\n" "$agh_ver"
+    printf "  Theme:          %s\n" "$THEME_NAME"
+    printf "  State dir:      %s\n" "$STATE_DIR"
+    printf "  Backups:        %s found in %s\n" "$backup_count" "$BACKUP_DIR"
+    printf '\n'
+    printf "${UI_HINT}%s${C_RESET}\n" "This script updates the AdGuardHome binary only."
+    printf "${UI_HINT}%s${C_RESET}\n" "Config, blocklists, and query logs are never modified."
+    printf "${UI_HINT}%s${C_RESET}\n" "Do not add this script to cron."
+    printf '\n'
+    [ "$NON_INTERACTIVE" -eq 1 ] && return 0
+    printf "${UI_HINT}> Press Enter to return...${C_RESET}"
+    read -r _DUMMY
+}
+
+show_theme_menu() {
+    while true; do
+        hr
+        printf '\n'
+        ui_section_bar "Theme Picker"
+        printf '\n'
+        ui_menu_item "1" "classic" "default"
+        ui_menu_item "2" "green"
+        ui_menu_item "3" "amber"
+        ui_menu_item "4" "ocean"
+        ui_menu_item "5" "mono" "no color"
+        printf '\n'
+        ui_menu_item "c" "cancel"
+        printf '\n'
+        printf "${C_CYAN}> Select theme [1-5 or c]: ${C_RESET}"
+        read -r choice
+        case "$choice" in
+            1) THEME_NAME="classic" ;;
+            2) THEME_NAME="green"   ;;
+            3) THEME_NAME="amber"   ;;
+            4) THEME_NAME="ocean"   ;;
+            5) THEME_NAME="mono"    ;;
+            c|C) return 0 ;;
+            *) ui_warn "Please select 1-5 or c."; continue ;;
+        esac
+        theme_save
+        theme_apply "$THEME_NAME"
+        ui_ok "Theme set: ${THEME_NAME}"
+        return 0
+    done
+}
+
+reset_menu_defaults() {
+    channel_load
+    FORCE=0
+    DRY_RUN=0
+    ROLLBACK=0
+    ROLLBACK_FILE=""
+    LIST_BACKUPS=0
+    DELETE_BACKUP=""
+    MIGRATE_FROM_PACKAGE=0
+    CONFIRMED_LAN=0
+}
+
+show_main_menu() {
+    while true; do
+        render_dashboard
+
+        ui_section_bar "Update"
+        ui_menu_item "1" "Update to latest stable (release)"
+        ui_menu_item "2" "Update to latest beta" "not for production"
+        ui_menu_item "3" "Update to latest edge" "development builds only"
+        ui_menu_item "4" "Update to latest development" "highly experimental"
+        ui_menu_item "5" "Force reinstall current channel version"
+        ui_menu_item "6" "Dry run (check versions, no changes)"
+        printf '\n'
+
+        ui_section_bar "Recovery"
+        ui_menu_item "7" "Rollback to previous version"
+        ui_menu_item "8" "List backups"
+        ui_menu_item "9" "Delete a backup"
+        printf '\n'
+
+        ui_section_bar "Options"
+        ui_menu_item "t" "Theme picker"
+        ui_menu_item "r" "Reset menu defaults"
+        ui_menu_item "a" "About"
+        ui_menu_item "e" "Exit"
+        printf '\n'
+
+        printf "${C_CYAN}> Select [1-9, t, r, a, e]: ${C_RESET}"
+        read -r choice
+
+        case "$choice" in
+            1) CHANNEL="release";      return 0 ;;
+            2) CHANNEL="beta";         return 0 ;;
+            3) CHANNEL="edge";         return 0 ;;
+            4) CHANNEL="development";  return 0 ;;
+            5) FORCE=1; return 0 ;;
+            6) DRY_RUN=1; return 0 ;;
+            7) ROLLBACK=1; return 0 ;;
+            8) LIST_BACKUPS=1; return 0 ;;
+            9)
+                printf "${C_CYAN}> Enter backup path (or 'all' to delete all): ${C_RESET}"
+                read -r del_target
+                DELETE_BACKUP="$del_target"
+                return 0
+                ;;
+            t|T) show_theme_menu ;;
+            r|R) reset_menu_defaults; ui_ok "Defaults reset." ;;
+            a|A) show_about ;;
+            e|E|c|C) ui_step "Exiting."; exit 0 ;;
+            *) ui_warn "Please select 1-9, t, r, a, or e." ;;
+        esac
+    done
+}
+
+
+
 main() {
+    theme_init
+    channel_load
     parse_args "$@"
-    setup_colors
+
+    mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 
     hr
     ui_step "${SCRIPT_NAME} v${SCRIPT_VERSION}"
     hr
     printf '\n'
+
+    # Show interactive main menu when run with no action flags in a terminal
+    local no_action=1
+    [ "$FORCE" -eq 1 ]                && no_action=0
+    [ "$DRY_RUN" -eq 1 ]              && no_action=0
+    [ "$ROLLBACK" -eq 1 ]             && no_action=0
+    [ "$LIST_BACKUPS" -eq 1 ]         && no_action=0
+    [ -n "$DELETE_BACKUP" ]           && no_action=0
+    [ "$MIGRATE_FROM_PACKAGE" -eq 1 ] && no_action=0
+
+    if [ "$no_action" -eq 1 ] && [ "$NON_INTERACTIVE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
+        show_main_menu
+    fi
 
     if [ "$LIST_BACKUPS" -eq 1 ]; then
         list_backups
@@ -1228,6 +1634,7 @@ main() {
     download_release
     install_binary
     verify_install
+    channel_save
     [ "$PERSIST_SYSUPGRADE" -eq 1 ] && ensure_sysupgrade_persistence
     cleanup
 
