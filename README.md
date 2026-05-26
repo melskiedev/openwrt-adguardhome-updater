@@ -1,8 +1,20 @@
 # openwrt-adguardhome-updater
 
-Vanilla OpenWrt AdGuard Home updater for **manual binary installs**.
+Vanilla OpenWrt AdGuard Home updater for manual AdGuardHome binary installs.
 
-Not intended for package-managed AdGuardHome installs via `apk` or `opkg`.
+Package-managed installs via `apk` or `opkg` are not updated directly. They can be migrated to standalone upstream binaries with `--migrate-from-package`.
+
+---
+
+## Disclaimer
+
+This script is provided for personal use only. Use at your own risk.
+
+The author is not responsible for any damage, data loss, bricked devices, broken networks, or any other issues that may result from using this script.
+
+Always perform a full sysupgrade backup before running this script. Ensure you have physical or LAN access to your router before proceeding with any update or migration.
+
+By using this script, you acknowledge that you understand the risks and accept full responsibility for the outcome.
 
 ---
 
@@ -18,18 +30,16 @@ The config file (`AdGuardHome.yaml`), blocklists, query logs, and all data are p
 
 | Requirement | Details |
 |---|---|
-| OS | Vanilla OpenWrt (any version with `sh`, `wget`, `tar`, `gzip`) |
-| Install type | Manual binary install only |
+| OS | Vanilla OpenWrt with `sh`, `tar`, and `gzip` |
+| Downloader | `curl` recommended; `wget` supported only if HTTPS-capable |
+| Install type | Manual binary install, or package-managed install when using `--migrate-from-package` |
 | Free space | At least 60 MB in `/tmp` |
 | AdGuardHome | Already installed and running as a service via `/etc/init.d/` |
 
-> This script will **refuse to run** if AdGuardHome is detected as package-managed by `apk` or `opkg`. Use your package manager to update instead:
-> ```sh
-> # OpenWrt 25.12+
-> apk update && apk upgrade adguardhome
+> Normal update mode refuses to overwrite package-managed AdGuardHome installs. To stay package-managed, update with `apk` or `opkg`. To convert the package-managed install to an upstream standalone binary, use:
 >
-> # OpenWrt 24.10 and older
-> opkg update && opkg upgrade adguardhome
+> ```sh
+> openwrt-adguardhome-updater --migrate-from-package --yes-i-have-lan-access
 > ```
 
 ---
@@ -54,25 +64,29 @@ Unsupported architectures are rejected before any download or install attempt.
 
 ## Install
 
+**Using wget:**
 ```sh
-wget -q https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -O /usr/bin/openwrt-adguardhome-updater && chmod +x /usr/bin/openwrt-adguardhome-updater && /usr/bin/openwrt-adguardhome-updater --dry-run
+wget -q https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -O /usr/bin/openwrt-adguardhome-updater && chmod +x /usr/bin/openwrt-adguardhome-updater && /usr/bin/openwrt-adguardhome-updater
+```
+
+**Using curl:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -o /usr/bin/openwrt-adguardhome-updater && chmod +x /usr/bin/openwrt-adguardhome-updater && /usr/bin/openwrt-adguardhome-updater
 ```
 
 > Run manually. Do not add to cron.
+
+> On some OpenWrt 25.12+ builds, `/usr/bin/wget` may point to `wget-nossl`, which cannot fetch HTTPS URLs. If wget fails with `HTTPS support not compiled in`, use the curl install command instead.
 
 ---
 
 ## Usage
 
-### Interactive menu
-
-Run with no flags in a terminal to open the interactive menu:
+Run with no flags in a terminal:
 
 ```sh
 openwrt-adguardhome-updater
 ```
-
-The menu shows a dashboard with router model, firmware, LAN IP, AdGuardHome version, web UI URL, current channel, and time. From the menu you can update, switch channels, rollback, manage backups, pick a theme, and view about info.
 
 ### Dry run first (always)
 
@@ -118,7 +132,7 @@ openwrt-adguardhome-updater --install-dir /opt/AdGuardHome
 
 | Flag | Description |
 |---|---|
-| *(no flags)* | Open interactive menu (when run in a terminal) |
+| *(no flags)* | Open menu (when run in a terminal) |
 | `--dry-run` | Check current vs latest version, make no changes |
 | `--force` | Reinstall even if already on latest version |
 | `--yes` / `-y` | Assume yes to all prompts |
@@ -219,12 +233,14 @@ After a successful update, verify manually:
 # Confirm binary version
 /etc/AdGuardHome/AdGuardHome --version
 
-# Check DNS port is listening (replace port with your configured DNS port)
-netstat -tulnp | grep <dns_port>
+# Check DNS port is listening and verify bind address
+netstat -tulnp | grep -E 'AdGuardHome|:3053|:2997|:3000'
 
-# Test DNS resolution through AdGuardHome directly
-nslookup cloudflare.com 127.0.0.1:<dns_port>
+# Test DNS resolution through the local resolver chain (dnsmasq -> AGH)
+nslookup cloudflare.com 127.0.0.1
 ```
+
+> The DNS listener should be bound to `127.0.0.1:<port>` or `[::1]:<port>` for loopback-only access. If it shows `0.0.0.0:<port>` or `:::port`, the service is listening on all interfaces and reachable from LAN clients directly.
 
 ---
 
@@ -257,23 +273,34 @@ Run this manually. The update process stops AdGuardHome briefly, which interrupt
 
 This tool does not install AdGuardHome from scratch.
 
-For a fresh install, use the official AdGuardHome installer or the OpenWrt package first. Once AdGuardHome is installed and running as a service, this tool can update the binary or migrate a package-managed install to an upstream standalone binary.
+For a fresh install, use the official AdGuardHome installer or the OpenWrt package first. Once AdGuardHome is installed and running as a service, this tool can update the binary or migrate a package-managed install to an upstream standalone binary. See the Migrating section above.
+
+---
+
+## Migrating from OpenWrt Package to Standalone Binary
+
+Package-managed installs are not updated directly in normal mode. To convert an `apk` or `opkg` AdGuardHome install to a standalone upstream binary:
 
 ```sh
-# After a fresh install via package manager, migrate to upstream binaries:
-openwrt-adguardhome-updater --migrate-from-apk --yes-i-have-lan-access
-# or for older OpenWrt:
-openwrt-adguardhome-updater --migrate-from-opkg --yes-i-have-lan-access
-
-# Then for all future updates:
-openwrt-adguardhome-updater
+openwrt-adguardhome-updater --migrate-from-package --yes-i-have-lan-access
 ```
+
+Aliases are also supported:
+
+```sh
+openwrt-adguardhome-updater --migrate-from-apk --yes-i-have-lan-access
+openwrt-adguardhome-updater --migrate-from-opkg --yes-i-have-lan-access
+```
+
+Migration briefly stops AdGuardHome, so DNS may drop during the process. Only run this when you have physical or LAN access to the router.
+
+After migration, do not update AdGuardHome with `apk` or `opkg`. Use this updater for all future updates.
 
 ---
 
 ## Channels
 
-The default channel is `release`. Select a channel from the interactive menu or via `--channel`.
+The default channel is `release`. Select a channel from the menu or via `--channel`.
 
 | Channel | Source | Notes |
 |---|---|---|
@@ -292,12 +319,6 @@ openwrt-adguardhome-updater --channel beta --dry-run
 openwrt-adguardhome-updater --channel edge --dry-run
 openwrt-adguardhome-updater --channel development --dry-run
 ```
-
----
-
-## Disclaimer
-
-This script is provided as-is without any warranty. It stops a running DNS service, replaces a binary, and restarts it. Always run `--dry-run` first. Always verify DNS is working after an update. Keep at least one backup before deleting any.
 
 ---
 
