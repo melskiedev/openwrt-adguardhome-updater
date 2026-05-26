@@ -74,6 +74,7 @@ CURRENT_VERSION=""
 LATEST_VERSION=""
 OWRT_VER=""
 FREE_MB=0
+DOWNLOADER=""
 
 
 # ──────────────────────────────────────────────────────────────
@@ -110,30 +111,33 @@ theme_apply() {
         *) USE_UNICODE=0 ;;
     esac
 
+    local e
+    e="$(printf '\033')"
+
     case "$render" in
         green)
-            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'
-            C_YELLOW='\033[1;33m'; C_CYAN='\033[0;36m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
-            UI_BAR='\033[30;42m'; UI_KEY='\033[30;41m'; UI_TITLE='\033[1;37m'; UI_HINT='\033[0;36m'
+            C_RESET="${e}[0m"; C_RED="${e}[0;31m"; C_GREEN="${e}[0;32m"
+            C_YELLOW="${e}[1;33m"; C_CYAN="${e}[0;36m"; C_DIM="${e}[0;37m"; C_BOLD="${e}[1m"
+            UI_BAR="${e}[30;42m"; UI_KEY="${e}[30;41m"; UI_TITLE="${e}[1;37m"; UI_HINT="${e}[0;36m"
             ;;
         amber)
-            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;33m'
-            C_YELLOW='\033[1;33m'; C_CYAN='\033[0;33m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
-            UI_BAR='\033[30;43m'; UI_KEY='\033[30;47m'; UI_TITLE='\033[1;33m'; UI_HINT='\033[0;33m'
+            C_RESET="${e}[0m"; C_RED="${e}[0;31m"; C_GREEN="${e}[0;33m"
+            C_YELLOW="${e}[1;33m"; C_CYAN="${e}[0;33m"; C_DIM="${e}[0;37m"; C_BOLD="${e}[1m"
+            UI_BAR="${e}[30;43m"; UI_KEY="${e}[30;47m"; UI_TITLE="${e}[1;33m"; UI_HINT="${e}[0;33m"
             ;;
         ocean)
-            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;36m'
-            C_YELLOW='\033[1;36m'; C_CYAN='\033[1;34m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
-            UI_BAR='\033[37;44m'; UI_KEY='\033[30;46m'; UI_TITLE='\033[1;36m'; UI_HINT='\033[0;36m'
+            C_RESET="${e}[0m"; C_RED="${e}[0;31m"; C_GREEN="${e}[0;36m"
+            C_YELLOW="${e}[1;36m"; C_CYAN="${e}[1;34m"; C_DIM="${e}[0;37m"; C_BOLD="${e}[1m"
+            UI_BAR="${e}[37;44m"; UI_KEY="${e}[30;46m"; UI_TITLE="${e}[1;36m"; UI_HINT="${e}[0;36m"
             ;;
         mono)
             C_RESET=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_DIM=''; C_BOLD=''
             UI_BAR=''; UI_KEY=''; UI_TITLE=''; UI_HINT=''
             ;;
         classic|*)
-            C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'
-            C_YELLOW='\033[0;33m'; C_CYAN='\033[0;36m'; C_DIM='\033[0;37m'; C_BOLD='\033[1m'
-            UI_BAR='\033[30;47m'; UI_KEY='\033[37;44m'; UI_TITLE='\033[1m'; UI_HINT='\033[0;37m'
+            C_RESET="${e}[0m"; C_RED="${e}[0;31m"; C_GREEN="${e}[0;32m"
+            C_YELLOW="${e}[0;33m"; C_CYAN="${e}[0;36m"; C_DIM="${e}[0;37m"; C_BOLD="${e}[1m"
+            UI_BAR="${e}[30;47m"; UI_KEY="${e}[37;44m"; UI_TITLE="${e}[1m"; UI_HINT="${e}[0;37m"
             ;;
     esac
 }
@@ -302,7 +306,7 @@ usage() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} [options]
 
-  (no flags)              Update to latest stable release (interactive)
+  (no flags)              Open interactive menu
   --dry-run               Check current vs latest version, make no changes
   --force                 Reinstall even if already on latest version
   --yes | -y              Assume yes to all prompts
@@ -353,6 +357,7 @@ parse_args() {
                 CHANNEL="release"
                 channel_save
                 ui_ok "Channel reset to release."
+                exit 0
                 ;;
             --yes|-y)          ASSUME_YES=1 ;;
             --non-interactive) NON_INTERACTIVE=1 ;;
@@ -371,6 +376,7 @@ parse_args() {
                 theme_save
                 theme_apply "classic"
                 ui_ok "Theme reset to classic."
+                exit 0
                 ;;
             --list-backups)    LIST_BACKUPS=1 ;;
             --install-dir)
@@ -572,7 +578,7 @@ get_latest_version() {
             # version.json and downloads the channel tarball directly.
             # If version.json is unavailable, fall back to the channel name.
             version_url="${AGH_STATIC_BASE}/${CHANNEL}/version.json"
-            response="$(wget -q -O - "$version_url" 2>/dev/null || true)"
+            response="$(http_get "$version_url" 2>/dev/null || true)"
             LATEST_VERSION="$(printf '%s' "$response" \
                 | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
                 | head -1 \
@@ -580,7 +586,7 @@ get_latest_version() {
             [ -n "$LATEST_VERSION" ] || LATEST_VERSION="$CHANNEL"
             ;;
         release|*)
-            response="$(wget -q -O - "$AGH_RELEASES_URL" 2>/dev/null)"
+            response="$(http_get "$AGH_RELEASES_URL")"
             [ -n "$response" ] || die "Failed to fetch latest release info from GitHub API."
             LATEST_VERSION="$(printf '%s' "$response" \
                 | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
@@ -675,6 +681,59 @@ show_web_access_url() {
 
 
 # ──────────────────────────────────────────────────────────────
+# Downloader
+# ──────────────────────────────────────────────────────────────
+
+detect_downloader() {
+    # Prefer curl. Fall back to wget only if HTTPS-capable.
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOADER="curl"
+        return 0
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        # Check if wget supports HTTPS by probing its help output.
+        # wget-nossl does not list 'https' in its help and cannot fetch HTTPS URLs.
+        if wget --help 2>&1 | grep -qi 'https'; then
+            DOWNLOADER="wget"
+            return 0
+        else
+            die "wget on this system does not support HTTPS (wget-nossl detected). Install curl: apk add curl"
+        fi
+    fi
+
+    die "No suitable downloader found. Install curl: apk add curl"
+}
+
+# Unified download wrapper. Usage: http_get <url> [output_file]
+# If output_file is omitted, writes to stdout.
+http_get() {
+    local url="$1"
+    local out="${2:-}"
+
+    case "$DOWNLOADER" in
+        curl)
+            if [ -n "$out" ]; then
+                curl -fsSL "$url" -o "$out"
+            else
+                curl -fsSL "$url"
+            fi
+            ;;
+        wget)
+            if [ -n "$out" ]; then
+                wget -q -O "$out" "$url"
+            else
+                wget -q -O - "$url"
+            fi
+            ;;
+        *)
+            die "No downloader configured. Run detect_downloader first."
+            ;;
+    esac
+}
+
+
+# ──────────────────────────────────────────────────────────────
 # Preflight
 # ──────────────────────────────────────────────────────────────
 
@@ -692,7 +751,9 @@ preflight_update() {
     detect_pkg_manager
     check_agh_pkg_managed
 
-    for dep in wget tar gzip; do
+    detect_downloader
+
+    for dep in tar gzip; do
         command -v "$dep" >/dev/null 2>&1 || die "Required dependency not found: ${dep}"
     done
 
@@ -718,6 +779,7 @@ interactive_preflight_display() {
 
     ui_ok "OpenWrt ${OWRT_VER} detected"
     ui_ok "Package manager: ${PKG_MANAGER}"
+    ui_ok "Downloader: ${DOWNLOADER}"
     ui_ok "AdGuardHome is a manual binary install"
 
     local cpu_arch
@@ -889,7 +951,7 @@ download_release() {
 
     ui_step "Channel:    ${CHANNEL}"
     ui_step "Downloading: ${download_url}"
-    wget -q -O "$TMP_TARBALL" "$download_url"
+    http_get "$download_url" "$TMP_TARBALL"
     [ -s "$TMP_TARBALL" ] || die "Download failed or empty file: ${TMP_TARBALL}"
     ui_ok "Download complete."
 }
@@ -946,26 +1008,23 @@ verify_dns_health() {
         return 1
     fi
 
-    # DNS resolution test is best-effort only. A transient WAN/upstream issue
-    # should not trigger a rollback if the process is running and port is bound.
-    ui_step "Testing DNS resolution against 127.0.0.1:${dns_port}..."
-    local test_host i resolved=0
-    for i in 1 2 3; do
-        for test_host in cloudflare.com google.com; do
-            if nslookup "$test_host" "127.0.0.1:${dns_port}" >/dev/null 2>&1 || \
-               nslookup "$test_host" "127.0.0.1" -port="$dns_port" >/dev/null 2>&1; then
-                ui_ok "DNS resolution OK: ${test_host}"
-                resolved=1
-                break 2
-            fi
-        done
-        sleep 2
+    # DNS resolution test is best-effort only. Tests through the local resolver
+    # chain (dnsmasq -> AGH) rather than directly to the AGH port, since BusyBox
+    # nslookup does not support custom port syntax.
+    ui_step "Testing DNS resolution through local resolver..."
+    local test_host resolved=0
+    for test_host in cloudflare.com google.com; do
+        if nslookup "$test_host" 127.0.0.1 >/dev/null 2>&1; then
+            ui_ok "DNS resolution OK: ${test_host}"
+            resolved=1
+            break
+        fi
     done
 
     if [ "$resolved" -eq 0 ]; then
-        ui_warn "DNS resolution test failed against 127.0.0.1:${dns_port}."
-        ui_warn "This may be a transient upstream/WAN issue. Process is running and port is bound."
-        ui_warn "Verify DNS manually: nslookup cloudflare.com 127.0.0.1:${dns_port}"
+        ui_warn "DNS resolution test failed through 127.0.0.1."
+        ui_warn "Process is running and AdGuardHome is listening on port ${dns_port}."
+        ui_warn "Verify manually: nslookup cloudflare.com 127.0.0.1"
     fi
 
     # Return success as long as process is running and port is listening.
@@ -1030,7 +1089,7 @@ restore_from_backup() {
 }
 
 verify_install() {
-    local installed_version dns_port
+    local installed_version
     installed_version="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 
     if [ "$installed_version" = "$LATEST_VERSION" ]; then
@@ -1038,9 +1097,6 @@ verify_install() {
     else
         ui_warn "Installed version (${installed_version:-unknown}) does not match expected (${LATEST_VERSION})."
     fi
-
-    dns_port="$(get_dns_port)"
-    verify_dns_health "$dns_port" || ui_warn "Manual DNS verification recommended."
 }
 
 
@@ -1481,8 +1537,15 @@ reset_menu_defaults() {
     CONFIRMED_LAN=0
 }
 
+safe_detect_for_dashboard() {
+    # Best-effort install detection so render_dashboard can show correct web port.
+    # Never fatal, never prints errors.
+    detect_agh_install >/dev/null 2>&1 || true
+}
+
 show_main_menu() {
     while true; do
+        safe_detect_for_dashboard
         render_dashboard
 
         ui_section_bar "Update"
@@ -1580,6 +1643,7 @@ main() {
         require_root_openwrt
         detect_agh_install
         detect_pkg_manager
+        detect_downloader
         detect_arch
         get_latest_version
 
