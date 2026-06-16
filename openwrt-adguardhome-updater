@@ -757,6 +757,11 @@ preflight_update() {
         command -v "$dep" >/dev/null 2>&1 || die "Required dependency not found: ${dep}"
     done
 
+    if [ ! -f /etc/ssl/certs/ca-certificates.crt ] && [ ! -f /etc/ssl/cert.pem ] && [ ! -d /etc/ssl/certs ]; then
+        ui_warn "CA certificate bundle not found. HTTPS downloads may fail."
+        ui_warn "Install ca-bundle with your package manager if downloads fail."
+    fi
+
     local free_kb
     free_kb="$(df /tmp | awk 'NR==2 {print $4}')"
     FREE_MB=$(( free_kb / 1024 ))
@@ -1297,7 +1302,7 @@ interactive_migration_summary() {
     ui_warn "DNS will briefly stop during migration."
     ui_warn "After migration, do not update AdGuardHome with ${PKG_MANAGER}."
     ui_warn "Future updates should use this updater."
-    ui_warn "Node config, blocklists, and query logs will be preserved."
+    ui_warn "Config, blocklists, and query logs will be preserved."
     printf '\n'
 
     if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
