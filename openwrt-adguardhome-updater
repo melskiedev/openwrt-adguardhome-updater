@@ -27,7 +27,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.06.18.04"
+SCRIPT_VERSION="2026.06.18.05"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -857,7 +857,9 @@ confirm_update() {
     confirm "Do you want to continue with the update?" "n" || die "Aborted by user."
 
     printf '\n'
-    if confirm "Add AdGuardHome and this updater to /etc/sysupgrade.conf?" "y"; then
+    if [ "$PERSIST_SYSUPGRADE" -eq 0 ]; then
+        ui_step "Skipping sysupgrade persistence (--no-persist)."
+    elif confirm "Add AdGuardHome and this updater to /etc/sysupgrade.conf?" "y"; then
         PERSIST_SYSUPGRADE=1
     else
         PERSIST_SYSUPGRADE=0
@@ -1154,7 +1156,11 @@ install_binary() {
 
 restore_from_backup() {
     local latest_backup dns_port
-    latest_backup="$(ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | head -1)"
+    if [ -n "$BACKUP_FILE_CREATED" ] && [ -f "$BACKUP_FILE_CREATED" ]; then
+        latest_backup="$BACKUP_FILE_CREATED"
+    else
+        latest_backup="$(ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | head -1)"
+    fi
     [ -n "$latest_backup" ] || {
         ui_err "No backup found in ${BACKUP_DIR}. Manual recovery required."
         return 1
