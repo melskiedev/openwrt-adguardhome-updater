@@ -32,6 +32,7 @@ The config file (`AdGuardHome.yaml`), blocklists, query logs, and all data are p
 |---|---|
 | OS | Vanilla OpenWrt with `sh`, `tar`, and `gzip` |
 | Downloader | `curl` recommended; `wget` supported only if HTTPS-capable |
+| Checksum tool | `sha256sum`, BusyBox `sha256sum`, or `openssl` (release channel only) |
 | Install type | Manual binary install, or package-managed install when using `--migrate-from-package` |
 | Free space | At least 60 MB in `/tmp` |
 | AdGuardHome | Already installed and running as a service via `/etc/init.d/` |
@@ -97,12 +98,15 @@ openwrt-adguardhome-updater --dry-run
 Expected output:
 
 ```
-[openwrt-adguardhome-updater] Install directory: /etc/AdGuardHome
-[openwrt-adguardhome-updater] Binary path:       /etc/AdGuardHome/AdGuardHome
-[openwrt-adguardhome-updater] Config path:       /etc/AdGuardHome/AdGuardHome.yaml
-[openwrt-adguardhome-updater] DNS port:          <detected from config>
-[openwrt-adguardhome-updater] Current version:   v0.107.x
-[openwrt-adguardhome-updater] Latest version:    v0.107.x
+[->] Checking prerequisites
+
+[OK] Install directory: /etc/AdGuardHome
+[OK] Binary:            /etc/AdGuardHome/AdGuardHome
+[OK] Config:            /etc/AdGuardHome/AdGuardHome.yaml
+[OK] Current version:   v0.107.x
+[OK] Latest version:    v0.107.x (release)
+
+[->] Dry run only. No changes made.
 ```
 
 Confirm the detected paths and versions are correct before proceeding.

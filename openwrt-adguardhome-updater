@@ -26,7 +26,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.06.18.01"
+SCRIPT_VERSION="2026.06.18.03"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -595,7 +595,10 @@ get_latest_version() {
         release|*)
             response="$(http_get "$AGH_RELEASES_URL")"
             [ -n "$response" ] || die "Failed to fetch latest release info from GitHub API."
-            LATEST_VERSION="$(printf '%s' "$response" \
+            if command -v jsonfilter >/dev/null 2>&1; then
+                LATEST_VERSION="$(printf '%s' "$response" | jsonfilter -e '@.tag_name' 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')"
+            fi
+            [ -n "$LATEST_VERSION" ] || LATEST_VERSION="$(printf '%s' "$response" \
                 | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
                 | head -1 \
                 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')"
@@ -721,16 +724,16 @@ http_get() {
     case "$DOWNLOADER" in
         curl)
             if [ -n "$out" ]; then
-                curl -fsSL "$url" -o "$out"
+                curl -fsSL --connect-timeout 30 --max-time 300 "$url" -o "$out"
             else
-                curl -fsSL "$url"
+                curl -fsSL --connect-timeout 30 --max-time 300 "$url"
             fi
             ;;
         wget)
             if [ -n "$out" ]; then
-                wget -q -O "$out" "$url"
+                wget -q --timeout=30 --tries=2 -O "$out" "$url"
             else
-                wget -q -O - "$url"
+                wget -q --timeout=30 --tries=2 -O - "$url"
             fi
             ;;
         *)
@@ -1058,6 +1061,10 @@ service_stop_agh() {
         killall -9 AdGuardHome 2>/dev/null
         sleep 1
     fi
+
+    if pidof AdGuardHome >/dev/null 2>&1; then
+        die "AdGuardHome could not be stopped. Aborting before replacing the binary."
+    fi
 }
 
 service_start_agh() {
@@ -1229,6 +1236,14 @@ list_backups() {
     [ "$found" -eq 1 ] || ui_warn "No backups found in ${BACKUP_DIR}."
 }
 
+has_backups() {
+    local f
+    for f in "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz; do
+        [ -f "$f" ] && return 0
+    done
+    return 1
+}
+
 safe_backup_path_or_die() {
     local target="$1"
     case "$target" in
@@ -1249,12 +1264,14 @@ do_delete_backup() {
             return
         }
         ui_warn "This will delete all ${count} backup(s) in ${BACKUP_DIR}."
-        printf "Are you sure? Type 'yes' to confirm: "
-        read -r confirm
-        [ "$confirm" = "yes" ] || {
-            ui_step "Aborted. No backups deleted."
-            return
-        }
+        if [ "$ASSUME_YES" -ne 1 ]; then
+            printf "Are you sure? Type 'yes' to confirm: "
+            read -r confirm_word
+            [ "$confirm_word" = "yes" ] || {
+                ui_step "Aborted. No backups deleted."
+                return
+            }
+        fi
         rm -f "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz
         ui_ok "All backups deleted."
     else
@@ -1507,6 +1524,10 @@ do_migrate_from_package() {
 # Main
 # ──────────────────────────────────────────────────────────────
 
+agh_version_from_binary() {
+    "$1" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1
+}
+
 render_dashboard() {
     local model fw_ver lan_ip agh_ver now tz_posix gmt_label offset
 
@@ -1534,7 +1555,7 @@ render_dashboard() {
     [ -n "$lan_ip" ] || lan_ip="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
     [ -n "$lan_ip" ] || lan_ip="unknown"
 
-    agh_ver="$(${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome} --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    agh_ver="$(agh_version_from_binary "${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome}")"
     [ -n "$agh_ver" ] || agh_ver="unknown"
 
     local web_port
@@ -1567,7 +1588,7 @@ show_about() {
     local backup_count agh_ver
 
     backup_count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
-    agh_ver="$(${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome} --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    agh_ver="$(agh_version_from_binary "${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome}")"
     [ -n "$agh_ver" ] || agh_ver="unknown"
 
     hr
@@ -1676,10 +1697,14 @@ show_main_menu() {
             4) CHANNEL="development";  return 0 ;;
             5) FORCE=1; return 0 ;;
             6) DRY_RUN=1; return 0 ;;
-            7) ROLLBACK=1; return 0 ;;
+            7)
+                list_backups
+                has_backups || continue
+                ROLLBACK=1; return 0 ;;
             8) LIST_BACKUPS=1; return 0 ;;
             9)
                 list_backups
+                has_backups || continue
                 printf "${C_CYAN}> Enter backup path (or 'all' to delete all, or blank to cancel): ${C_RESET}"
                 read -r del_target
                 if [ -z "$del_target" ]; then
