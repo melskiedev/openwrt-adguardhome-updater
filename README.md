@@ -65,19 +65,24 @@ Unsupported architectures are rejected before any download or install attempt.
 
 ## Install
 
-**Using wget:**
+On many OpenWrt routers, **wget is already available** and is the easiest way to install. **curl is optional** — if `curl` is not installed or HTTPS fails, use wget instead.
+
+**Using wget (recommended on OpenWrt):**
 ```sh
 wget -q https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -O /usr/bin/openwrt-adguardhome-updater && chmod +x /usr/bin/openwrt-adguardhome-updater && /usr/bin/openwrt-adguardhome-updater
 ```
 
-**Using curl:**
+**Using curl** (requires the `curl` package and CA certificates):
+```sh
+opkg update && opkg install curl ca-bundle
+```
 ```sh
 curl -fsSL https://raw.githubusercontent.com/melskiedev/openwrt-adguardhome-updater/main/openwrt-adguardhome-updater -o /usr/bin/openwrt-adguardhome-updater && chmod +x /usr/bin/openwrt-adguardhome-updater && /usr/bin/openwrt-adguardhome-updater
 ```
 
 > Run manually. Do not add to cron.
 
-> On some OpenWrt 25.12+ builds, `/usr/bin/wget` may point to `wget-nossl`, which cannot fetch HTTPS URLs. If wget fails with `HTTPS support not compiled in`, use the curl install command instead.
+> On some OpenWrt 25.12+ builds, `/usr/bin/wget` may point to `wget-nossl`, which cannot fetch HTTPS URLs. If wget fails with `HTTPS support not compiled in`, install curl: `opkg install curl ca-bundle` (or `apk add curl ca-bundle`).
 
 ---
 

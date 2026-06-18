@@ -27,7 +27,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.06.19.02"
+SCRIPT_VERSION="2026.06.19.03"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -1274,8 +1274,10 @@ show_no_backups_screen() {
 }
 
 read_menu_choice() {
-    read -r "$1"
-    eval "$1=\$(printf '%s' \"\$$1\" | tr -d '\r')"
+    # Avoid eval — BusyBox ash mishandles "$$" in eval strings.
+    REPLY=""
+    read -r REPLY
+    REPLY="$(printf '%s' "$REPLY" | tr -d '\r')"
 }
 
 safe_backup_path_or_die() {
@@ -1723,7 +1725,8 @@ show_main_menu() {
         printf '\n'
 
         printf "${C_CYAN}> Select [1-9, t, r, a, e]: ${C_RESET}"
-        read_menu_choice choice
+        read_menu_choice
+        choice="$REPLY"
 
         case "$choice" in
             1) CHANNEL="release";      return 0 ;;
@@ -1746,8 +1749,9 @@ show_main_menu() {
                     continue
                 fi
                 list_backups
-                printf "${C_CYAN}> Enter backup path (or 'all' to delete all, or blank to cancel): ${C_RESET}"
-                read_menu_choice del_target
+                printf '%s\n' "> Enter backup path (or 'all' to delete all, or blank to cancel):"
+                read_menu_choice
+                del_target="$REPLY"
                 if [ -z "$del_target" ]; then
                     ui_step "Delete backup cancelled."
                     continue
