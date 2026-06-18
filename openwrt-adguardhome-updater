@@ -27,7 +27,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.06.19.01"
+SCRIPT_VERSION="2026.06.19.02"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -1244,19 +1244,38 @@ list_backups() {
     [ "$found" -eq 1 ] || ui_warn "No backups found in ${BACKUP_DIR}."
 }
 
-has_backups() {
-    local f
+backup_count() {
+    local count=0 f
     for f in "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz; do
-        [ -f "$f" ] && return 0
+        [ -f "$f" ] && count=$((count + 1))
     done
-    return 1
+    printf '%s' "$count"
 }
 
-menu_press_enter() {
-    is_tty || return 0
+has_backups() {
+    [ "$(backup_count)" -gt 0 ]
+}
+
+show_no_backups_screen() {
+    local action="$1"
+    hr
     printf '\n'
-    printf "${UI_HINT}> Press Enter to return to the menu...${C_RESET}"
+    ui_section_bar "Backups"
+    printf '\n'
+    ui_warn "No backups found in ${BACKUP_DIR}."
+    case "$action" in
+        delete)   ui_step "Nothing to delete." ;;
+        rollback) ui_step "Nothing to roll back to." ;;
+        *)        ui_step "Run an update first to create a backup." ;;
+    esac
+    printf '\n'
+    printf '%s\n' "> Press Enter to return to the menu..."
     read -r _DUMMY
+}
+
+read_menu_choice() {
+    read -r "$1"
+    eval "$1=\$(printf '%s' \"\$$1\" | tr -d '\r')"
 }
 
 safe_backup_path_or_die() {
@@ -1596,6 +1615,7 @@ render_dashboard() {
     fi
     printf "  Time:         %s\n" "$now"
     printf "  Theme:        %s\n" "$THEME_NAME"
+    printf "  Updater:      %s\n" "$SCRIPT_VERSION"
     printf '\n'
 }
 
@@ -1703,7 +1723,7 @@ show_main_menu() {
         printf '\n'
 
         printf "${C_CYAN}> Select [1-9, t, r, a, e]: ${C_RESET}"
-        read -r choice
+        read_menu_choice choice
 
         case "$choice" in
             1) CHANNEL="release";      return 0 ;;
@@ -1713,21 +1733,21 @@ show_main_menu() {
             5) FORCE=1; return 0 ;;
             6) DRY_RUN=1; return 0 ;;
             7)
-                list_backups
                 if ! has_backups; then
-                    menu_press_enter
+                    show_no_backups_screen "rollback"
                     continue
                 fi
+                list_backups
                 ROLLBACK=1; return 0 ;;
             8) LIST_BACKUPS=1; return 0 ;;
             9)
-                list_backups
                 if ! has_backups; then
-                    menu_press_enter
+                    show_no_backups_screen "delete"
                     continue
                 fi
+                list_backups
                 printf "${C_CYAN}> Enter backup path (or 'all' to delete all, or blank to cancel): ${C_RESET}"
-                read -r del_target
+                read_menu_choice del_target
                 if [ -z "$del_target" ]; then
                     ui_step "Delete backup cancelled."
                     continue
