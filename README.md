@@ -107,6 +107,14 @@ Expected output:
 
 Confirm the detected paths and versions are correct before proceeding.
 
+### Update without prompts
+
+Use `--yes` when you already know you want to proceed:
+
+```sh
+openwrt-adguardhome-updater --yes
+```
+
 ### Update
 
 ```sh
@@ -135,8 +143,7 @@ openwrt-adguardhome-updater --install-dir /opt/AdGuardHome
 | *(no flags)* | Open menu (when run in a terminal) |
 | `--dry-run` | Check current vs latest version, make no changes |
 | `--force` | Reinstall even if already on latest version |
-| `--yes` / `-y` | Assume yes to all prompts |
-| `--non-interactive` | Skip all prompts, use defaults |
+| `--yes` / `-y` | Skip confirmation prompts |
 | `--no-persist` | Skip adding paths to `/etc/sysupgrade.conf` |
 | `--keep-tmp` | Do not delete `/tmp` download files after install |
 | `--install-dir <path>` | Override detected install directory |
@@ -175,11 +182,12 @@ The init script is detected from `/etc/init.d/adguardhome` or `/etc/init.d/AdGua
 1. Preflight: root check, OpenWrt check, install detection, package-manager guard, dependency check, free space check, arch detection, version fetch
 2. Backup: full `AGH_DIR` + init script + updater script archived to `/root/adguardhome-updater/backups/`, keeping last 3
 3. Download: `AdGuardHome_linux_<arch>.tar.gz` from the selected channel
-4. Install: stop service, replace binary, start service
-5. Health check: process running + port listening (authoritative). DNS resolution test is best-effort only and will not trigger rollback on WAN/upstream issues.
-6. Auto-rollback: if process or port check fails, the latest backup is restored automatically
-7. Channel save: selected channel is persisted to `/root/adguardhome-updater/channel.conf`
-8. sysupgrade persistence: key paths added to `/etc/sysupgrade.conf`
+4. Verify: on the `release` channel, SHA256 is checked against `checksums.txt` from the same GitHub release (`beta`/`edge`/`development` skip verification with a warning)
+5. Install: stop service, replace binary, start service
+6. Health check: process running + port listening (authoritative). DNS resolution test is best-effort only and will not trigger rollback on WAN/upstream issues.
+7. Auto-rollback: if process or port check fails, the latest backup is restored automatically
+8. Channel save: selected channel is persisted to `/root/adguardhome-updater/channel.conf`
+9. sysupgrade persistence: key paths added to `/etc/sysupgrade.conf`
 
 ### Backup contents
 
@@ -196,6 +204,8 @@ It contains:
 - Manifest with paths and timestamp
 
 A maximum of 3 backups are kept. Older ones are pruned automatically.
+
+> Backups contain your full AdGuardHome directory, including config and any credentials stored in `AdGuardHome.yaml`. Treat backup files as sensitive.
 
 ---
 
@@ -309,9 +319,9 @@ The default channel is `release`. Select a channel from the menu or via `--chann
 | `edge` | `static.adtidy.org/adguardhome/edge/` | Development builds, not for production |
 | `development` | `static.adtidy.org/adguardhome/development/` | Highly experimental |
 
-For `release`, the script reads the latest version from the GitHub API and downloads the matching release asset.
+For `release`, the script reads the latest version from the GitHub API, downloads the matching release asset, and verifies the tarball SHA256 against `checksums.txt` from the same release.
 
-For `beta`, `edge`, and `development`, the script downloads the latest channel tarball directly from AdGuard's static server. `version.json` is fetched as a best-effort for version display only. If it is unavailable, the updater still proceeds with the download.
+For `beta`, `edge`, and `development`, the script downloads the latest channel tarball directly from AdGuard's static server. Checksum verification is skipped (with a warning). `version.json` is fetched as a best-effort for version display only. If it is unavailable, the updater still proceeds with the download.
 
 ```sh
 # CLI channel selection

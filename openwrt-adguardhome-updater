@@ -26,7 +26,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.05.24.01"
+SCRIPT_VERSION="2026.06.18.01"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -61,7 +61,6 @@ ROLLBACK_FILE=""
 LIST_BACKUPS=0
 DELETE_BACKUP=""
 ASSUME_YES=0
-NON_INTERACTIVE=0
 PERSIST_SYSUPGRADE=1
 MIGRATE_FROM_PACKAGE=0
 CONFIRMED_LAN=0
@@ -75,6 +74,7 @@ LATEST_VERSION=""
 OWRT_VER=""
 FREE_MB=0
 DOWNLOADER=""
+CLEANUP_RAN=0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -257,8 +257,8 @@ confirm() {
     local question="$1" default="${2:-n}" answer prompt
 
     [ "$ASSUME_YES" -eq 1 ] && return 0
-    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-        [ "$default" = "y" ] && return 0; return 1
+    if ! is_tty; then
+        die "Not running in a terminal. Use --yes to proceed without prompts."
     fi
     [ "$default" = "y" ] && prompt="Y/n" || prompt="y/N"
     while true; do
@@ -286,9 +286,17 @@ log() {
 }
 
 cleanup() {
+    [ "$CLEANUP_RAN" -eq 1 ] && return
+    CLEANUP_RAN=1
     if [ "$KEEP_TMP" -eq 0 ] && [ -d "$TMP_DIR" ]; then
         rm -rf "$TMP_DIR"
     fi
+}
+
+on_interrupt() {
+    ui_err "Interrupted."
+    cleanup
+    exit 130
 }
 
 die() {
@@ -306,16 +314,16 @@ usage() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} [options]
 
-  (no flags)              Open interactive menu
+  (no flags)              Open menu
   --dry-run               Check current vs latest version, make no changes
   --force                 Reinstall even if already on latest version
-  --yes | -y              Assume yes to all prompts
-  --non-interactive       Skip all prompts, use defaults
+  --yes | -y              Skip confirmation prompts
   --no-persist            Skip adding paths to /etc/sysupgrade.conf
   --keep-tmp              Do not delete /tmp download files after install
   --install-dir <path>    Override detected install directory
   --channel <name>        Set release channel: release, beta, edge, development (default: release)
   --reset-channel         Reset saved channel to release
+  --theme <name>          Set UI theme: classic, green, amber, ocean, mono
   --reset-theme           Reset saved theme to classic
   --rollback              Restore the latest backup
   --rollback <file>       Restore a specific backup file
@@ -360,7 +368,6 @@ parse_args() {
                 exit 0
                 ;;
             --yes|-y)          ASSUME_YES=1 ;;
-            --non-interactive) NON_INTERACTIVE=1 ;;
             --no-persist)      PERSIST_SYSUPGRADE=0 ;;
             --theme)
                 [ -n "$2" ] || die "--theme requires a value: classic, green, amber, ocean, mono"
@@ -774,10 +781,10 @@ preflight_update() {
 
 
 # ──────────────────────────────────────────────────────────────
-# Interactive display
+# Preflight and confirmation
 # ──────────────────────────────────────────────────────────────
 
-interactive_preflight_display() {
+show_preflight() {
     hr
     ui_step "Checking prerequisites"
     printf '\n'
@@ -817,7 +824,7 @@ interactive_preflight_display() {
     printf '\n'
 }
 
-interactive_update_summary() {
+confirm_update() {
     hr
     printf '\n'
 
@@ -859,11 +866,21 @@ interactive_update_summary() {
 # Version check
 # ──────────────────────────────────────────────────────────────
 
+latest_version_is_placeholder() {
+    case "$LATEST_VERSION" in
+        beta|edge|development) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 is_update_needed() {
     if [ "$FORCE" -eq 1 ]; then
         return 0
     fi
     if [ "$CURRENT_VERSION" = "not installed" ] || [ "$CURRENT_VERSION" = "unknown" ]; then
+        return 0
+    fi
+    if latest_version_is_placeholder; then
         return 0
     fi
     [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]
@@ -928,7 +945,9 @@ backup_current() {
     local backup_count
     backup_count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l)"
     if [ "$backup_count" -gt 3 ]; then
-        ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz | tail -n +4 | xargs rm -f
+        ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | tail -n +4 | while read -r old_backup; do
+            [ -n "$old_backup" ] && rm -f "$old_backup"
+        done
         ui_step "Old backups pruned, keeping last 3."
     fi
 }
@@ -959,6 +978,63 @@ download_release() {
     http_get "$download_url" "$TMP_TARBALL"
     [ -s "$TMP_TARBALL" ] || die "Download failed or empty file: ${TMP_TARBALL}"
     ui_ok "Download complete."
+
+    verify_tarball_checksum "$tarball_name"
+}
+
+
+sha256_file() {
+    local file="$1"
+    local hash=""
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash="$(sha256sum "$file" | awk '{print $1}')"
+    elif command -v busybox >/dev/null 2>&1; then
+        hash="$(busybox sha256sum "$file" 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+        hash="$(openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}')"
+    fi
+
+    [ -n "$hash" ] || return 1
+    printf '%s\n' "$hash"
+}
+
+verify_tarball_checksum() {
+    local tarball_name="$1"
+    local checksums_file="${TMP_DIR}/checksums.txt"
+    local expected actual
+
+    case "$CHANNEL" in
+        development|beta|edge)
+            ui_warn "Checksum verification skipped for ${CHANNEL} channel (best-effort download)."
+            return 0
+            ;;
+    esac
+
+    ui_step "Verifying SHA256 checksum..."
+    actual="$(sha256_file "$TMP_TARBALL")" || \
+        die "SHA256 tool not found. Install coreutils (sha256sum) or openssl to verify release downloads."
+
+    http_get "${AGH_DOWNLOAD_BASE}/${LATEST_VERSION}/checksums.txt" "$checksums_file"
+    [ -s "$checksums_file" ] || die "Failed to download checksums.txt for ${LATEST_VERSION}."
+
+    expected="$(grep -F "$tarball_name" "$checksums_file" | awk '{print $1}' | head -1)"
+    [ -n "$expected" ] || die "Checksum not found in checksums.txt for ${tarball_name}."
+
+    if [ "$actual" != "$expected" ]; then
+        die "Checksum mismatch for ${tarball_name}. Expected ${expected}, got ${actual}."
+    fi
+    ui_ok "Checksum verified."
+}
+
+extract_tarball() {
+    ui_step "Extracting tarball..."
+    mkdir -p "$TMP_EXTRACT"
+    rm -rf "${TMP_EXTRACT:?}/"*
+    tar xzf "$TMP_TARBALL" -C "$TMP_EXTRACT" || die "Extraction failed."
+
+    [ -f "${TMP_EXTRACT}/AdGuardHome/AdGuardHome" ] || \
+        die "Extracted binary not found at: ${TMP_EXTRACT}/AdGuardHome/AdGuardHome"
 }
 
 
@@ -1043,13 +1119,10 @@ verify_dns_health() {
 # ──────────────────────────────────────────────────────────────
 
 install_binary() {
-    ui_step "Extracting tarball..."
-    tar xzf "$TMP_TARBALL" -C "$TMP_EXTRACT"
-    [ $? -eq 0 ] || die "Extraction failed."
+    extract_tarball
 
     local extracted_bin
     extracted_bin="${TMP_EXTRACT}/AdGuardHome/AdGuardHome"
-    [ -f "$extracted_bin" ] || die "Extracted binary not found at: ${extracted_bin}"
 
     service_stop_agh
 
@@ -1095,12 +1168,27 @@ restore_from_backup() {
 
 verify_install() {
     local installed_version
-    installed_version="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    installed_version="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1)"
+
+    if latest_version_is_placeholder; then
+        ui_ok "Installed version: ${installed_version:-unknown} (${CHANNEL} channel)"
+        return 0
+    fi
 
     if [ "$installed_version" = "$LATEST_VERSION" ]; then
         ui_ok "Version confirmed: ${installed_version}"
     else
         ui_warn "Installed version (${installed_version:-unknown}) does not match expected (${LATEST_VERSION})."
+    fi
+}
+
+display_installed_version() {
+    local ver
+    ver="$("$AGH_BINARY" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1)"
+    if latest_version_is_placeholder; then
+        [ -n "$ver" ] && printf '%s' "$ver" || printf '%s channel' "$CHANNEL"
+    else
+        printf '%s' "$LATEST_VERSION"
     fi
 }
 
@@ -1274,7 +1362,7 @@ validate_migration_preconditions() {
     ui_ok "Migration preconditions passed."
 }
 
-interactive_migration_summary() {
+confirm_migration() {
     hr
     printf '\n'
 
@@ -1305,9 +1393,11 @@ interactive_migration_summary() {
     ui_warn "Config, blocklists, and query logs will be preserved."
     printf '\n'
 
-    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-        ui_step "Non-interactive migration confirmed by --yes-i-have-lan-access."
+    if [ "$ASSUME_YES" -eq 1 ]; then
         return 0
+    fi
+    if ! is_tty; then
+        die "Not running in a terminal. Use --yes to proceed without prompts."
     fi
 
     while true; do
@@ -1363,6 +1453,7 @@ do_migrate_from_package() {
 
     # Download upstream binary before removing package
     download_release
+    extract_tarball
 
     service_stop_agh
 
@@ -1404,7 +1495,7 @@ do_migrate_from_package() {
     cleanup
 
     hr
-    ui_ok "Migration complete. AdGuardHome ${LATEST_VERSION} is now running as a standalone binary."
+    ui_ok "Migration complete. AdGuardHome $(display_installed_version) is now running as a standalone binary."
     show_web_access_url
     ui_step "Future updates: ${SCRIPT_NAME}"
     ui_step "Rollback if needed: ${SCRIPT_NAME} --rollback"
@@ -1493,7 +1584,7 @@ show_about() {
     printf "${UI_HINT}%s${C_RESET}\n" "Config, blocklists, and query logs are never modified."
     printf "${UI_HINT}%s${C_RESET}\n" "Do not add this script to cron."
     printf '\n'
-    [ "$NON_INTERACTIVE" -eq 1 ] && return 0
+    is_tty || return 0
     printf "${UI_HINT}> Press Enter to return...${C_RESET}"
     read -r _DUMMY
 }
@@ -1611,6 +1702,8 @@ show_main_menu() {
 
 main() {
     theme_init
+    trap cleanup EXIT
+    trap on_interrupt INT TERM
     channel_load
     parse_args "$@"
 
@@ -1621,7 +1714,7 @@ main() {
     hr
     printf '\n'
 
-    # Show interactive main menu when run with no action flags in a terminal
+    # Show main menu when run with no flags in a terminal
     local no_action=1
     [ "$FORCE" -eq 1 ]                && no_action=0
     [ "$DRY_RUN" -eq 1 ]              && no_action=0
@@ -1630,7 +1723,7 @@ main() {
     [ -n "$DELETE_BACKUP" ]           && no_action=0
     [ "$MIGRATE_FROM_PACKAGE" -eq 1 ] && no_action=0
 
-    if [ "$no_action" -eq 1 ] && [ "$NON_INTERACTIVE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
+    if [ "$no_action" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
         show_main_menu
     fi
 
@@ -1664,13 +1757,13 @@ main() {
 
         validate_migration_preconditions
         get_current_version
-        interactive_migration_summary
+        confirm_migration
         do_migrate_from_package
         exit 0
     fi
 
     preflight_update
-    interactive_preflight_display
+    show_preflight
 
     if [ "$DRY_RUN" -eq 1 ]; then
         hr
@@ -1685,7 +1778,11 @@ main() {
             "Arch tarball:      AdGuardHome_linux_${AGH_ARCH}.tar.gz"
         printf '\n'
         if is_update_needed; then
-            ui_step "Update available: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+            if latest_version_is_placeholder; then
+                ui_step "Latest ${CHANNEL} channel tarball available (installed: ${CURRENT_VERSION})."
+            else
+                ui_step "Update available: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+            fi
         else
             ui_ok "Already on latest version (${CURRENT_VERSION})."
         fi
@@ -1699,7 +1796,7 @@ main() {
         exit 0
     fi
 
-    interactive_update_summary
+    confirm_update
 
     ui_step "Update: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
     printf '\n'
@@ -1713,7 +1810,7 @@ main() {
     cleanup
 
     hr
-    ui_ok "AdGuardHome updated to ${LATEST_VERSION}."
+    ui_ok "AdGuardHome updated to $(display_installed_version)."
     show_web_access_url
     ui_step "Rollback if needed: ${SCRIPT_NAME} --rollback"
     printf '\n'
