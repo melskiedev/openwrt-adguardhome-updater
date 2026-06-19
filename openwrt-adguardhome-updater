@@ -27,7 +27,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.06.19.04"
+SCRIPT_VERSION="2026.06.19.05"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -887,12 +887,24 @@ is_update_needed() {
 # Backup
 # ──────────────────────────────────────────────────────────────
 
+external_config_rel() {
+    # Return relative path for config outside AGH_DIR (e.g. opkg split layout).
+    if [ -n "$AGH_CONFIG" ] && [ -f "$AGH_CONFIG" ]; then
+        case "$AGH_CONFIG" in
+            "${AGH_DIR}"|"${AGH_DIR}"/*) return 1 ;;
+            *) printf '%s' "${AGH_CONFIG#/}"; return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 backup_current() {
     ui_step "Creating backup..."
     mkdir -p "$BACKUP_DIR"
     mkdir -p "$TMP_DIR"
 
     local ts backup_file manifest tmp_manifest init_rel updater_rel
+    local agh_dir_rel config_rel=""
     ts="$(date '+%Y%m%d-%H%M%S')"
     backup_file="${BACKUP_DIR}/adguardhome-backup-${ts}.tar.gz"
     BACKUP_FILE_CREATED="$backup_file"
@@ -904,12 +916,13 @@ backup_current() {
 
     # Safety guard: never archive /usr/bin wholesale. If AGH_DIR is /usr/bin,
     # back up only the binary itself, not the entire directory.
-    local agh_dir_rel
     if [ "$AGH_DIR" = "/usr/bin" ]; then
         agh_dir_rel="usr/bin/AdGuardHome"
     else
         agh_dir_rel="${AGH_DIR#/}"
     fi
+
+    config_rel="$(external_config_rel)" || config_rel=""
 
     {
         echo "SCRIPT_VERSION=${SCRIPT_VERSION}"
@@ -921,21 +934,39 @@ backup_current() {
     } > "$tmp_manifest"
 
     if [ -f "/usr/bin/${SCRIPT_NAME}" ]; then
-        tar czf "$backup_file" -C / \
-            "$agh_dir_rel" \
-            "$init_rel" \
-            "$updater_rel" \
-            "$manifest" 2>/dev/null
+        if [ -n "$config_rel" ]; then
+            tar czf "$backup_file" -C / \
+                "$agh_dir_rel" \
+                "$init_rel" \
+                "$updater_rel" \
+                "$config_rel" \
+                "$manifest" 2>/dev/null
+        else
+            tar czf "$backup_file" -C / \
+                "$agh_dir_rel" \
+                "$init_rel" \
+                "$updater_rel" \
+                "$manifest" 2>/dev/null
+        fi
     else
-        tar czf "$backup_file" -C / \
-            "$agh_dir_rel" \
-            "$init_rel" \
-            "$manifest" 2>/dev/null
+        if [ -n "$config_rel" ]; then
+            tar czf "$backup_file" -C / \
+                "$agh_dir_rel" \
+                "$init_rel" \
+                "$config_rel" \
+                "$manifest" 2>/dev/null
+        else
+            tar czf "$backup_file" -C / \
+                "$agh_dir_rel" \
+                "$init_rel" \
+                "$manifest" 2>/dev/null
+        fi
     fi
 
     rm -f "$tmp_manifest"
 
     [ -s "$backup_file" ] || die "Backup failed. Aborting before making changes."
+    tar tzf "$backup_file" >/dev/null 2>&1 || die "Backup archive is corrupt or incomplete."
     ui_ok "Backup created: ${backup_file}"
 
     local count
@@ -1127,8 +1158,16 @@ install_binary() {
     service_stop_agh
 
     ui_step "Installing new binary to ${AGH_BINARY}..."
-    cp "$extracted_bin" "$AGH_BINARY"
-    chmod +x "$AGH_BINARY"
+    if ! cp "$extracted_bin" "$AGH_BINARY"; then
+        ui_err "Failed to copy new binary."
+        restore_from_backup
+        die "Install failed. Backup restore attempted."
+    fi
+    if ! chmod +x "$AGH_BINARY"; then
+        ui_err "Failed to set binary permissions."
+        restore_from_backup
+        die "Install failed. Backup restore attempted."
+    fi
 
     service_start_agh
 
@@ -1156,6 +1195,7 @@ restore_from_backup() {
     }
 
     ui_step "Restoring from: ${latest_backup}"
+    service_stop_agh
     tar xzf "$latest_backup" -C /
     [ $? -eq 0 ] || {
         ui_err "Backup extraction failed."
@@ -1203,15 +1243,37 @@ display_installed_version() {
 
 ensure_sysupgrade_persistence() {
     local conf="/etc/sysupgrade.conf"
+    local agh_entry
+
     touch "$conf"
 
     ui_step "Ensuring sysupgrade persistence in ${conf}..."
-    for entry in "${AGH_DIR}/" "$AGH_INIT" "/usr/bin/${SCRIPT_NAME}" "${STATE_DIR}/"; do
+
+    if [ "$AGH_DIR" = "/usr/bin" ]; then
+        agh_entry="/usr/bin/AdGuardHome"
+    else
+        agh_entry="${AGH_DIR}/"
+    fi
+
+    for entry in "$agh_entry" "$AGH_INIT" "/usr/bin/${SCRIPT_NAME}" "${STATE_DIR}/"; do
         if ! grep -qxF "$entry" "$conf" 2>/dev/null; then
             printf '%s\n' "$entry" >> "$conf"
             ui_step "Added: ${entry}"
         fi
     done
+
+    if [ -n "$AGH_CONFIG" ] && [ -f "$AGH_CONFIG" ]; then
+        case "$AGH_CONFIG" in
+            "${AGH_DIR}"|"${AGH_DIR}"/*) ;;
+            *)
+                if ! grep -qxF "$AGH_CONFIG" "$conf" 2>/dev/null; then
+                    printf '%s\n' "$AGH_CONFIG" >> "$conf"
+                    ui_step "Added: ${AGH_CONFIG}"
+                fi
+                ;;
+        esac
+    fi
+
     ui_ok "sysupgrade.conf updated."
 }
 
@@ -1617,9 +1679,9 @@ render_dashboard() {
 }
 
 show_about() {
-    local backup_count agh_ver
+    local backup_total agh_ver
 
-    backup_count="$(backup_count)"
+    backup_total="$(backup_count)"
     agh_ver="$(agh_version_from_binary "${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome}")"
     [ -n "$agh_ver" ] || agh_ver="unknown"
 
@@ -1631,7 +1693,7 @@ show_about() {
     printf "  AdGuardHome:    %s\n" "$agh_ver"
     printf "  Theme:          %s\n" "$THEME_NAME"
     printf "  State dir:      %s\n" "$STATE_DIR"
-    printf "  Backups:        %s found in %s\n" "$backup_count" "$BACKUP_DIR"
+    printf "  Backups:        %s found in %s\n" "$backup_total" "$BACKUP_DIR"
     printf '\n'
     printf "${UI_HINT}%s${C_RESET}\n" "This script updates the AdGuardHome binary only."
     printf "${UI_HINT}%s${C_RESET}\n" "Config, blocklists, and query logs are never modified."
