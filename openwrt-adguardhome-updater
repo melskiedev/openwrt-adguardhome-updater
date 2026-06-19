@@ -27,7 +27,7 @@
 #   using --migrate-from-package (or --migrate-from-apk / --migrate-from-opkg).
 # - Should not be run as a cron job (briefly stops DNS)
 
-SCRIPT_VERSION="2026.06.19.03"
+SCRIPT_VERSION="2026.06.19.04"
 SCRIPT_NAME="openwrt-adguardhome-updater"
 
 STATE_DIR="/root/adguardhome-updater"
@@ -219,7 +219,7 @@ box() {
     if [ "${USE_UNICODE:-0}" -eq 1 ]; then
         printf '┌──────────────────────────────────────────────────────────────────┐\n'
         while [ $# -gt 0 ]; do
-            printf '│ %-68s │\n' "$1"; shift
+            printf '│ %-64s │\n' "$1"; shift
         done
         printf '└──────────────────────────────────────────────────────────────────┘\n'
     else
@@ -265,7 +265,8 @@ confirm() {
     [ "$default" = "y" ] && prompt="Y/n" || prompt="y/N"
     while true; do
         printf "${C_CYAN}> %s (%s) ${C_RESET}" "$question" "$prompt"
-        read -r answer
+        read_user_input
+        answer="$REPLY"
         [ -n "$answer" ] || answer="$default"
         case "$answer" in
             y|Y|yes|YES) return 0 ;;
@@ -273,18 +274,6 @@ confirm() {
             *) ui_warn "Please answer y or n." ;;
         esac
     done
-}
-
-log() {
-    local level="$1"; shift
-    local msg="$*"
-    case "$level" in
-        INFO)    ui_step "$msg" ;;
-        SUCCESS) ui_ok   "$msg" ;;
-        WARN)    ui_warn "$msg" ;;
-        ERROR)   ui_err  "$msg" ;;
-        *)       printf "[%s] %s\n" "$SCRIPT_NAME" "$msg" ;;
-    esac
 }
 
 cleanup() {
@@ -949,9 +938,9 @@ backup_current() {
     [ -s "$backup_file" ] || die "Backup failed. Aborting before making changes."
     ui_ok "Backup created: ${backup_file}"
 
-    local backup_count
-    backup_count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l)"
-    if [ "$backup_count" -gt 3 ]; then
+    local count
+    count="$(backup_count)"
+    if [ "$count" -gt 3 ]; then
         ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | tail -n +4 | while read -r old_backup; do
             [ -n "$old_backup" ] && rm -f "$old_backup"
         done
@@ -1269,15 +1258,19 @@ show_no_backups_screen() {
         *)        ui_step "Run an update first to create a backup." ;;
     esac
     printf '\n'
-    printf '%s\n' "> Press Enter to return to the menu..."
-    read -r _DUMMY
+    printf "${UI_HINT}> Press Enter to return to the menu...${C_RESET}\n"
+    read_user_input
 }
 
-read_menu_choice() {
-    # Avoid eval — BusyBox ash mishandles "$$" in eval strings.
+read_user_input() {
     REPLY=""
     read -r REPLY
     REPLY="$(printf '%s' "$REPLY" | tr -d '\r')"
+}
+
+# Alias for menu callers
+read_menu_choice() {
+    read_user_input
 }
 
 safe_backup_path_or_die() {
@@ -1302,7 +1295,8 @@ do_delete_backup() {
         ui_warn "This will delete all ${count} backup(s) in ${BACKUP_DIR}."
         if [ "$ASSUME_YES" -ne 1 ]; then
             printf "Are you sure? Type 'yes' to confirm: "
-            read -r confirm_word
+            read_user_input
+            confirm_word="$REPLY"
             [ "$confirm_word" = "yes" ] || {
                 ui_step "Aborted. No backups deleted."
                 return
@@ -1455,7 +1449,8 @@ confirm_migration() {
 
     while true; do
         printf "${C_CYAN}> Are you sure you want to migrate? (y/N) ${C_RESET}"
-        read -r answer
+        read_user_input
+        answer="$REPLY"
         [ -n "$answer" ] || answer="n"
         case "$answer" in
             y|Y|yes|YES) break ;;
@@ -1624,7 +1619,7 @@ render_dashboard() {
 show_about() {
     local backup_count agh_ver
 
-    backup_count="$(ls -1 "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+    backup_count="$(backup_count)"
     agh_ver="$(agh_version_from_binary "${AGH_BINARY:-/etc/AdGuardHome/AdGuardHome}")"
     [ -n "$agh_ver" ] || agh_ver="unknown"
 
@@ -1644,7 +1639,7 @@ show_about() {
     printf '\n'
     is_tty || return 0
     printf "${UI_HINT}> Press Enter to return...${C_RESET}"
-    read -r _DUMMY
+    read_user_input
 }
 
 show_theme_menu() {
@@ -1662,7 +1657,8 @@ show_theme_menu() {
         ui_menu_item "c" "cancel"
         printf '\n'
         printf "${C_CYAN}> Select theme [1-5 or c]: ${C_RESET}"
-        read -r choice
+        read_user_input
+        choice="$REPLY"
         case "$choice" in
             1) THEME_NAME="classic" ;;
             2) THEME_NAME="green"   ;;
