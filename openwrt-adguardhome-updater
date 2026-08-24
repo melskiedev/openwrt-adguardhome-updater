@@ -930,6 +930,7 @@ backup_current() {
         echo "AGH_BINARY=${AGH_BINARY}"
         echo "AGH_CONFIG=${AGH_CONFIG}"
         echo "AGH_INIT=${AGH_INIT}"
+        echo "AGH_VERSION=${CURRENT_VERSION}"
         echo "BACKUP_CREATED=$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$tmp_manifest"
 
@@ -1335,6 +1336,45 @@ read_menu_choice() {
     read_user_input
 }
 
+backup_version_from_manifest() {
+    # Read AGH_VERSION out of the manifest packed inside a backup tarball.
+    # Older backups predate this field and have no readable manifest; both
+    # cases fall back to "unknown" rather than guessing from the filename.
+    local file="$1" manifest_path version
+    manifest_path="$(tar tzf "$file" 2>/dev/null | grep 'backup-manifest-.*\.txt$' | head -n 1)"
+    if [ -n "$manifest_path" ]; then
+        version="$(tar xzf "$file" -O "$manifest_path" 2>/dev/null | sed -n 's/^AGH_VERSION=//p' | head -1)"
+    fi
+    [ -n "$version" ] || version="unknown"
+    printf '%s' "$version"
+}
+
+backup_timestamp_from_filename() {
+    local file="$1" base ts
+    base="$(basename "$file")"
+    ts="$(printf '%s' "$base" | sed -n 's/^adguardhome-backup-\([0-9]\{8\}-[0-9]\{6\}\)\.tar\.gz$/\1/p')"
+    [ -n "$ts" ] || ts="unknown-time"
+    printf '%s' "$ts"
+}
+
+backup_menu_gather() {
+    BACKUP_MENU_LIST="$(ls -1t "${BACKUP_DIR}"/adguardhome-backup-*.tar.gz 2>/dev/null)"
+}
+
+backup_menu_print() {
+    local f version ts size
+    BACKUP_MENU_COUNT=0
+    for f in $BACKUP_MENU_LIST; do
+        [ -f "$f" ] || continue
+        BACKUP_MENU_COUNT=$((BACKUP_MENU_COUNT + 1))
+        version="$(backup_version_from_manifest "$f")"
+        ts="$(backup_timestamp_from_filename "$f")"
+        size="$(du -sh "$f" 2>/dev/null | cut -f1)"
+        printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s  %s\n" \
+            "$BACKUP_MENU_COUNT" "$version" "$ts" "$size" "$(basename "$f")"
+    done
+}
+
 safe_backup_path_or_die() {
     local target="$1"
     case "$target" in
@@ -1368,9 +1408,64 @@ do_delete_backup() {
         ui_ok "All backups deleted."
     else
         safe_backup_path_or_die "$target"
+        local version
+        version="$(backup_version_from_manifest "$target")"
+        ui_warn "This will delete: $(basename "$target")  (version ${version})"
+        if [ "$ASSUME_YES" -ne 1 ]; then
+            printf "Are you sure? Type 'yes' to confirm: "
+            read_user_input
+            confirm_word="$REPLY"
+            [ "$confirm_word" = "yes" ] || {
+                ui_step "Aborted. No backup deleted."
+                return
+            }
+        fi
         rm -f "$target"
         ui_ok "Deleted: ${target}"
     fi
+}
+
+show_backup_delete_menu() {
+    local selection
+
+    hr
+    printf '\n'
+    ui_step "Available backups:"
+    printf '\n'
+
+    backup_menu_gather
+    backup_menu_print
+
+    printf '\n'
+    printf "  ${C_YELLOW}[a] Delete ALL backups${C_RESET}\n"
+    printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
+    printf '\n'
+    printf "${C_CYAN}> Select backup to delete [1-%s, a, or c]: ${C_RESET}" "$BACKUP_MENU_COUNT"
+    read_menu_choice
+    selection="$REPLY"
+
+    case "$selection" in
+        ''|c|C)
+            ui_step "Delete backup cancelled."
+            return 1
+            ;;
+        a|A)
+            DELETE_BACKUP="all"
+            return 0
+            ;;
+        *[!0-9]*)
+            ui_warn "Invalid selection."
+            return 1
+            ;;
+    esac
+
+    if [ "$selection" -lt 1 ] || [ "$selection" -gt "$BACKUP_MENU_COUNT" ]; then
+        ui_warn "Selection out of range."
+        return 1
+    fi
+
+    DELETE_BACKUP="$(printf '%s\n' "$BACKUP_MENU_LIST" | awk "NR==$selection")"
+    [ -n "$DELETE_BACKUP" ] || { ui_warn "Selected backup could not be resolved."; return 1; }
 }
 
 
@@ -1806,16 +1901,10 @@ show_main_menu() {
                     show_no_backups_screen "delete"
                     continue
                 fi
-                list_backups
-                printf '%s\n' "> Enter backup path (or 'all' to delete all, or blank to cancel):"
-                read_menu_choice
-                del_target="$REPLY"
-                if [ -z "$del_target" ]; then
-                    ui_step "Delete backup cancelled."
-                    continue
+                if show_backup_delete_menu; then
+                    return 0
                 fi
-                DELETE_BACKUP="$del_target"
-                return 0
+                continue
                 ;;
             t|T) show_theme_menu ;;
             r|R) reset_menu_defaults; ui_ok "Defaults reset." ;;
